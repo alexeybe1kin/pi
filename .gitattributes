@@ -1,0 +1,8 @@
+# This service runs on Linux. A CRLF in a shell script or an entrypoint is a
+# "bad interpreter" error there, and nothing on a Windows machine will show it
+# before the container fails.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary

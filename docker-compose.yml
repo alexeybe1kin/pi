@@ -1,0 +1,31 @@
+name: pi
+
+services:
+  pi:
+    build: .
+    container_name: pi-api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PI_DB_PATH: /data/pi.db
+      PI_OLLAMA_URL: http://ollama:11434
+    ports:
+      # Loopback only. Reached from the owner's devices over Tailscale, never
+      # from the public internet.
+      - "127.0.0.1:8050:8050"
+    volumes:
+      # The transcript lives here. MemoryGate's evidence cites message ids from
+      # this database, so losing it orphans the citations - back it up.
+      - pi_data:/data
+    networks:
+      - conker_net
+
+volumes:
+  pi_data:
+
+networks:
+  conker_net:
+    external: true
+    name: conker_net

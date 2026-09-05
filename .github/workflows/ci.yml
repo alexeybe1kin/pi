@@ -1,0 +1,89 @@
+name: CI
+
+# Checks the contract, not the prose. A convention nobody checks decays into a
+# convention nobody follows, which is why docs/module-contract.md ends with an
+# enforcement section rather than a promise.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet -r requirements-dev.txt
+          pip install --quiet pytest httpx
+
+      - name: The module contract requires these files to exist
+        run: |
+          missing=""
+          for f in README.md LICENSE CHANGELOG.md .gitattributes; do
+            [ -f "$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "missing required files:$missing" >&2
+            echo "See docs/module-contract.md in the conker repository." >&2
+            exit 1
+          fi
+
+      - name: Line endings must be LF
+        # These services run on Linux. A CRLF in an entrypoint is a "bad
+        # interpreter" failure that nothing on a Windows machine surfaces
+        # before the container dies.
+        run: |
+          if git grep -Il $'\r' -- . ; then
+            echo "CRLF found in tracked files; .gitattributes should normalise these." >&2
+            exit 1
+          fi
+          echo "all tracked text files are LF"
+
+      - name: Tests
+        run: python -m pytest tests/ --ignore=tests/test_module_contract.py -q
+
+  contract:
+    # The health contract is an HTTP contract, so it is asserted against a
+    # running container rather than an in-process app object - the thing that
+    # ships is the image, and an in-process check inherits whatever global
+    # state earlier tests left behind.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pytest httpx
+
+      - name: Build and start
+        run: |
+          docker network create conker_net || true
+          echo "PI_ADMIN_KEY=ci-only-key-not-a-secret-1234" > .env
+          docker compose up -d --build
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:8050/health" >/dev/null 2>&1; then
+              echo "healthy after ~${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "service never became reachable" >&2
+          docker compose logs --tail 50
+          exit 1
+
+      - name: Module contract
+        run: python -m pytest tests/test_module_contract.py -q
+
+      - if: always()
+        run: docker compose down -v
