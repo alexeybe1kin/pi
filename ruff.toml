@@ -1,0 +1,32 @@
+# Lint and format settings for Pi.
+#
+# Explicit rather than default, because the defaults move between ruff releases
+# and a lint set that changes under you produces diffs nobody asked for. Pinned
+# in requirements-dev.txt for the same reason.
+
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # import order
+    "UP",        # modern syntax for the target version
+    "B",         # bugbear
+    "SIM",       # obvious simplifications
+    "ISC",       # implicit string concatenation, which hides missing commas
+    "RUF",
+]
+ignore = [
+    # Health checks and status endpoints catch broadly on purpose. This service
+    # reports `unavailable` with a reason when a dependency misbehaves; a check
+    # that raised instead would take down the very endpoint the owner uses to
+    # find out what is wrong. See the truthful-status rule in CLAUDE.md.
+    "BLE001",
+]
+
+[lint.per-file-ignores]
+# Test doubles subclass stdlib handlers whose method names are fixed by the
+# stdlib, and hold shared state as class attributes on purpose.
+"tests/*" = ["N802", "RUF012"]

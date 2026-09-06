@@ -92,7 +92,8 @@ def test_reason_never_leaks_to_an_unauthenticated_caller(health):
         reason = str(check.get("reason", ""))
         assert not reason.startswith("/"), f"{name} reason is an absolute path: {reason!r}"
         assert " /" not in reason, f"{name} reason embeds an absolute path: {reason!r}"
-        assert not re.search(r"[A-Za-z]:\\\\", reason), f"{name} reason embeds a Windows path: {reason!r}"
+        assert not re.search(r"[A-Za-z]:\\\\", reason), \
+            f"{name} reason embeds a Windows path: {reason!r}"
         assert "://" not in reason, f"{name} reason embeds a URL: {reason!r}"
         assert "Traceback" not in reason
         assert len(reason) <= 120, f"{name} reason is too long to be coarse: {reason!r}"

@@ -7,21 +7,25 @@ Tool calls arrive in #29 and go out through ToolGate, never from here.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from .loop import Loop, TurnFailed
+from .loop import ActedWithoutReply, Loop, TurnFailed
 from .openrouter import OpenRouterProvider
 from .providers import OllamaProvider
 from .routing import Router
 from .store import Store
+from .toolgate import ToolGateClient
 
-SERVICE_VERSION = "0.1.0"
+log = logging.getLogger("pi")
+
+SERVICE_VERSION = "0.3.0"
 HEALTHY = {"ok", "not_configured"}
 HEALTH_CACHE_SECONDS = 5.0
 
@@ -45,7 +49,14 @@ async def lifespan(app: FastAPI):
     # nothing would leave the owner looking at a request that vanished.
     interrupted = store.mark_interrupted_turns()
 
-    local = OllamaProvider(os.environ.get("PI_OLLAMA_URL", "http://ollama:11434"))
+    # Local inference is slow on modest hardware and costs nothing to wait for,
+    # so the ceiling is generous. It exists to catch a hung server, not to give
+    # up on a model that is still thinking - a timeout that fires on a working
+    # model turns "slow" into "failed", which is a lie about what happened.
+    local = OllamaProvider(
+        os.environ.get("PI_OLLAMA_URL", "http://ollama:11434"),
+        timeout=_seconds("PI_LOCAL_TIMEOUT_S", 600.0),
+    )
 
     # Free by default: a fresh install works with no payment and no key. The
     # hosted provider only exists if one was supplied, and even then it refuses
@@ -57,12 +68,23 @@ async def lifespan(app: FastAPI):
         hosted = OpenRouterProvider(
             openrouter_key,
             allow_paid=os.environ.get("PI_ALLOW_PAID_MODELS", "").strip() in {"1", "true", "yes"},
+            timeout=_seconds("PI_HOSTED_TIMEOUT_S", 180.0),
         )
+
+    # The only way Pi acts on the world. Without a key it acts on nothing,
+    # which is a working install rather than a broken one - Conker still talks
+    # and still remembers.
+    toolgate_key = os.environ.get("PI_TOOLGATE_KEY", "").strip()
+    toolgate = ToolGateClient(
+        os.environ.get("PI_TOOLGATE_URL", "http://toolgate-api:8010"), toolgate_key,
+        timeout=_seconds("PI_TOOLGATE_TIMEOUT_S", 120.0),
+    ) if toolgate_key else None
 
     app.state.admin_key = admin_key
     app.state.store = store
     app.state.local = local
     app.state.hosted = hosted
+    app.state.toolgate = toolgate
     app.state.interrupted_at_startup = interrupted
     app.state.router = Router(
         local_provider=local, hosted_provider=hosted,
@@ -71,6 +93,7 @@ async def lifespan(app: FastAPI):
     app.state.loop = Loop(
         store, app.state.router,
         system_prompt=os.environ.get("PI_SYSTEM_PROMPT", ""),
+        toolgate=toolgate,
     )
     yield
 
@@ -98,6 +121,40 @@ class TurnRequest(BaseModel):
     owner_requested_strong: bool = False
 
 
+def _seconds(name: str, default: float) -> float:
+    """A timeout from the environment, or the default if it is not a number.
+
+    A malformed value falls back rather than stopping the service: the owner
+    typing "60s" should not take Conker offline, and the log line says what was
+    used instead of what was asked for.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s is not a number (%r); using %ss", name, raw, default)
+        return default
+    if value <= 0:
+        log.warning("%s must be positive (got %s); using %ss", name, value, default)
+        return default
+    return value
+
+
+def _acted_without_reply(exc: ActedWithoutReply) -> dict:
+    """The one answer that is true when a tool ran and the model then did not.
+
+    Not an error status, and not `complete` either. The action happened, it is
+    recorded, and the caller is told plainly that the reply is what is missing
+    and where to ask for it again.
+    """
+    return {"turn_id": exc.turn_id, "status": "acted_no_reply", "acted": True,
+            "message": None, "detail": exc.cause,
+            "hint": f"the action ran and was recorded; POST /turns/{exc.turn_id}/resume "
+                    "to ask for the reply again - it will not run the action a second time"}
+
+
 @app.get("/health")
 def health():
     """Shape is fixed by the Conker module contract - see docs/module-contract.md."""
@@ -114,6 +171,8 @@ def health():
         # lying about what is wrong.
         "hosted_provider": (app.state.hosted.health() if app.state.hosted
                             else {"status": "not_configured", "reason": "no API key"}),
+        "action_boundary": (app.state.toolgate.health() if app.state.toolgate
+                            else {"status": "not_configured", "reason": "no execution key"}),
     }
     degraded = sorted(name for name, c in checks.items() if c["status"] not in HEALTHY)
     result = {
@@ -122,7 +181,7 @@ def health():
         "status": "degraded" if degraded else "ok",
         "degraded": degraded,
         "checks": checks,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "checked_at": datetime.now(UTC).isoformat(),
     }
     _health_cache["result"] = result
     _health_cache["at"] = now
@@ -157,10 +216,67 @@ def run_turn(session_id: str, body: TurnRequest):
             "is_analysis": body.is_analysis,
             "owner_requested_strong": body.owner_requested_strong,
         })
+    except ActedWithoutReply as exc:
+        # Deliberately not an error status. A tool ran, so this request did the
+        # thing that actually matters, and the one detail missing is what the
+        # model would have said about it. An error code would invite a retry,
+        # and retrying this turn would run the action a second time.
+        return _acted_without_reply(exc)
     except TurnFailed as exc:
         # 503, not 500: the provider did not answer, which is a state the caller
         # can act on. The user's message is already stored either way.
         raise HTTPException(503, f"turn failed: {exc.reason}") from exc
+
+
+@app.get("/turns/unreplied", dependencies=[Depends(require_key)])
+def unreplied():
+    """Turns that acted but never reported back.
+
+    Resumable, and resuming asks only for the missing reply - the action is
+    never repeated. Separate from /approvals on purpose: these need a retry,
+    not a decision.
+    """
+    return {"results": app.state.store.acted_without_reply()}
+
+
+@app.get("/approvals", dependencies=[Depends(require_key)])
+def approvals():
+    """Every turn parked on the owner, across all sessions.
+
+    One queue rather than a per-session hunt: an approval the owner never sees
+    is an action that silently never happens.
+    """
+    return {"results": app.state.store.awaiting_approval()}
+
+
+@app.post("/turns/{turn_id}/resume", dependencies=[Depends(require_key)])
+def resume(turn_id: str):
+    """Continue a parked turn after the owner approved it in ToolGate.
+
+    Pi does not grant approvals and does not hold them. This replays the exact
+    stored action; ToolGate consumes the nonce, once, and refuses a replay.
+    """
+    try:
+        return app.state.loop.resume_turn(turn_id)
+    except ActedWithoutReply as exc:
+        return _acted_without_reply(exc)
+    except TurnFailed as exc:
+        raise HTTPException(409, f"cannot resume: {exc.reason}") from exc
+
+
+@app.get("/tools", dependencies=[Depends(require_key)])
+def tools():
+    """What Pi may currently do, as ToolGate sees it - not as Pi remembers."""
+    if app.state.toolgate is None:
+        return {"status": "not_configured", "results": []}
+    try:
+        found = app.state.toolgate.tools()
+    except Exception as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__, "results": []}
+    return {"status": "ok", "results": [
+        {"id": t.id, "name": t.name, "description": t.description, "inputs": t.inputs}
+        for t in found
+    ]}
 
 
 @app.get("/models", dependencies=[Depends(require_key)])

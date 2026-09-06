@@ -17,9 +17,10 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS turns (
     id           TEXT PRIMARY KEY,
     session_id   TEXT NOT NULL REFERENCES sessions(id),
     status       TEXT NOT NULL,                  -- running | complete | interrupted | failed
+                                                 --  | awaiting_approval | acted_no_reply
     provider     TEXT,
     model        TEXT,
     input_tokens  INTEGER,
@@ -55,6 +57,19 @@ CREATE TABLE IF NOT EXISTS turns (
     latency_ms    INTEGER,
     route_tier   TEXT,
     route_reason TEXT,
+    -- The parked action, kept whole so the retry is the same action the owner
+    -- was shown. Reconstructing it later from anything else would be a
+    -- different action wearing the same approval.
+    approval_request_id TEXT,
+    approval_tool_id    TEXT,
+    approval_args       TEXT,
+    approval_expires_at TEXT,
+    -- Whether this turn changed the world. A different fact from whether it
+    -- produced a reply, and the one the owner most needs to be true: a tool
+    -- that ran and a model that then failed to narrate it is not a turn where
+    -- nothing happened. Written before the narration is attempted, so a crash
+    -- in between cannot lose it.
+    acted        INTEGER NOT NULL DEFAULT 0,
     started_at   REAL NOT NULL,
     ended_at     REAL,
     detail       TEXT
@@ -99,9 +114,12 @@ class Store:
         after the upgrade.
         """
         have = {row["name"] for row in db.execute("PRAGMA table_info(turns)")}
-        for column in ("route_tier", "route_reason"):
+        for column in ("route_tier", "route_reason", "approval_request_id",
+                       "approval_tool_id", "approval_args", "approval_expires_at"):
             if column not in have:
                 db.execute(f"ALTER TABLE turns ADD COLUMN {column} TEXT")
+        if "acted" not in have:
+            db.execute("ALTER TABLE turns ADD COLUMN acted INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -193,7 +211,9 @@ class Store:
 
     def finish_turn(self, turn_id: str, status: str, **fields: Any) -> None:
         allowed = {"provider", "model", "input_tokens", "output_tokens", "cached_tokens",
-                   "cost_usd", "latency_ms", "detail", "route_tier", "route_reason"}
+                   "cost_usd", "latency_ms", "detail", "route_tier", "route_reason",
+                   "approval_request_id", "approval_tool_id", "approval_args",
+                   "approval_expires_at", "acted"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unknown turn fields: {sorted(unknown)}")
@@ -205,12 +225,67 @@ class Store:
                 (status, time.time(), *fields.values(), turn_id),
             )
 
+    def acted_without_reply(self) -> list[dict]:
+        """Every turn that changed the world but never said what happened.
+
+        The same reasoning as the approval queue: an action whose result the
+        owner never sees is, to them, indistinguishable from one that silently
+        went wrong. These are all resumable, and resuming asks only for the
+        missing reply - the action is not repeated.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM turns WHERE status='acted_no_reply' ORDER BY started_at"
+            ).fetchall()
+        return [{**dict(r), "approval_args": json.loads(r["approval_args"] or "null")}
+                for r in rows]
+
+    def mark_acted(self, turn_id: str) -> None:
+        """Record that this turn has now changed the world, before anything else.
+
+        Called the moment a tool returns, and deliberately not folded into
+        `finish_turn`: the turn is still running, so `ended_at` must stay unset.
+        The ordering is the point. Between the action happening and the model
+        narrating it there is a window where the process can die, and a record
+        written only afterwards would leave the owner reading `interrupted` for
+        an action that already ran.
+        """
+        with self._connect() as db:
+            db.execute("UPDATE turns SET acted=1 WHERE id=?", (turn_id,))
+
+    def awaiting_approval(self) -> list[dict]:
+        """Every turn parked on the owner, across all sessions.
+
+        The dashboard needs one queue rather than a per-session hunt: an
+        approval the owner never sees is an action that silently never happens.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM turns WHERE status='awaiting_approval' ORDER BY started_at"
+            ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["approval_args"] = json.loads(item["approval_args"] or "null")
+            out.append(item)
+        return out
+
+    def get_turn(self, turn_id: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["approval_args"] = json.loads(item["approval_args"] or "null")
+        return item
+
     def turns(self, session_id: str) -> list[dict]:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT * FROM turns WHERE session_id=? ORDER BY started_at", (session_id,)
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r), "approval_args": json.loads(r["approval_args"] or "null")}
+                for r in rows]
 
     def mark_interrupted_turns(self) -> int:
         """Called at startup. A turn that was running when the process died did
@@ -219,7 +294,14 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE turns SET status='interrupted', ended_at=?,"
-                " detail='the process stopped while this turn was running'"
+                # An interrupted turn that had already acted is not the same event
+                # as one that had not, and that difference is the only thing the
+                # owner actually needs from this row.
+                " detail=CASE WHEN acted=1"
+                "   THEN 'the process stopped after this turn acted, before it replied'"
+                "   ELSE 'the process stopped while this turn was running' END"
+                # Only 'running'. A turn parked on the owner is not interrupted -
+                # it is waiting, and a restart does not withdraw the question.
                 " WHERE status='running'",
                 (time.time(),),
             )

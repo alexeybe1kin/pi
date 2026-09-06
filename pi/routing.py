@@ -14,16 +14,16 @@ needs the record this produces.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class Tier(str, Enum):
+class Tier(StrEnum):
     LOCAL = "local"      # free, on the box, no network
     CHEAP = "cheap"      # free tier, hosted
     STRONG = "strong"    # the best available under the current spend policy
 
 
-class Reason(str, Enum):
+class Reason(StrEnum):
     DEFAULT = "default"
     TOOLS_REQUIRED = "tools_required"
     RETRY_AFTER_FAILURE = "retry_after_failure"

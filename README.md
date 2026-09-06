@@ -58,6 +58,15 @@ Precedence is **environment → file → default**.
 | `PI_OPENROUTER_KEY` | *(empty)* | Optional. Without it Pi answers locally and says so. |
 | `PI_ALLOW_PAID_MODELS` | *(off)* | Opt in to models that cost money. Off means **free only**, enforced in code. |
 | `PI_SYSTEM_PROMPT` | *(empty)* | Prepended to every conversation. |
+| `PI_TOOLGATE_URL` | `http://toolgate-api:8010` | The action boundary. |
+| `PI_TOOLGATE_KEY` | *(empty)* | A **scoped** ToolGate execution key. Without it Pi acts on nothing and reports `not_configured`. |
+| `PI_LOCAL_TIMEOUT_S` | `600` | Generous on purpose — see below. |
+| `PI_HOSTED_TIMEOUT_S` | `180` | |
+| `PI_TOOLGATE_TIMEOUT_S` | `120` | |
+
+A timeout here exists to catch a **hung** server, not to give up on a model that is still thinking.
+Local inference on modest hardware genuinely takes minutes, and a ceiling that fires on a working
+model turns *slow* into *failed* — which is a lie about what happened.
 
 ## API
 
@@ -69,6 +78,10 @@ Precedence is **environment → file → default**.
 | `GET /sessions/{id}` | key | The session with its messages and turns. |
 | `POST /sessions/{id}/turns` | key | Run one turn. |
 | `POST /sessions/{id}/fork` | key | Close with a summary and open a child. |
+| `GET /tools` | key | What Pi may currently do, **as ToolGate sees it** — not as Pi remembers. |
+| `GET /approvals` | key | Every turn parked on the owner, across all sessions. |
+| `GET /turns/unreplied` | key | Turns that acted but never reported back. |
+| `POST /turns/{id}/resume` | key | Continue a parked turn after the owner approved it. |
 
 A turn returns the session that **answered**, which may not be the one you asked: if history had
 outgrown the window it forked first, and `forked_from` says so rather than leaving you to assume.
@@ -76,6 +89,33 @@ outgrown the window it forked first, and `forked_from` says so rather than leavi
 `POST /turns` answers **503** when the provider does not answer. The message you sent is stored
 either way — it was said, and a transcript that drops what was said because the answer failed is not
 a transcript.
+
+## Acting, and asking first
+
+Pi **executes nothing itself**. Every action goes through ToolGate, which is the only thing that
+can run one and the only thing that can approve one. Pi is given a *scoped* execution key and asks
+ToolGate what that key may reach on every turn, rather than caching it — the owner can widen or
+narrow scope at any moment.
+
+When a tool needs confirmation the turn **parks**: status `awaiting_approval`, with the exact tool
+and arguments stored whole. That is not a failure and is deliberately not recorded as one — the
+owner has not said no, they have not been asked yet. A restart does not withdraw the question.
+
+Resuming replays **the stored action**, not one rebuilt from the conversation, so an approval can
+never be spent on a different action than the one the owner was shown. ToolGate consumes the nonce
+once; a replay fails closed.
+
+### An action that happened is never recorded as one that did not
+
+A tool can succeed and the model can *then* fail to say so. The action is real, the approval is
+spent, and the world has changed — so that turn is recorded as **`acted_no_reply`**, never `failed`,
+and `POST /turns/{id}/resume` asks only for the missing reply without running the action again.
+
+For the same reason neither `/turns` nor `/resume` answers with an error status in that case: an
+error code invites a retry, and retrying the whole turn would do the thing twice. They answer `200`
+with `status: acted_no_reply` and say plainly what is missing. `GET /turns/unreplied` lists them,
+because an action whose result the owner never sees is, to them, the same as one that silently went
+wrong.
 
 ## Turns are recorded, not just run
 
@@ -85,6 +125,8 @@ would read as free.
 
 **A turn that was running when the process stopped is marked `interrupted` at the next startup**,
 with the reason. Saying nothing would leave the owner looking at a request that simply vanished.
+A turn that had already **acted** before the process died says so — it is not the same event as one
+that died before touching anything, and one message for both would describe the wrong one.
 
 ## Status vocabulary
 

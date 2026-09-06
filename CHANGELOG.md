@@ -4,6 +4,49 @@ Versions are the module's own, not an API revision. A change to the shape of any
 endpoint is a contract change and gets its own entry — replacing a module has to
 be a decision with visible consequences.
 
+## 0.3.0
+
+The action boundary, and the approval round trip.
+
+- **Pi can act, and only through ToolGate.** Pi executes nothing itself. It is
+  given a *scoped* execution key and asks ToolGate what that key may reach on
+  every turn rather than caching it, because the owner can change scope at any
+  moment and a cached list would let Pi offer a tool it no longer has.
+- **A tool call is a line of JSON the loop owns**, not a provider's native
+  tool-calling schema. Pi routes across local, free hosted and paid models and
+  their formats disagree; a format the loop owns behaves identically everywhere.
+  The parser is anchored to a whole line, so prose *about* a tool call is not
+  acted on as one.
+- **A tool outside the key's scope is never forwarded.** ToolGate would refuse
+  it, but forwarding would put an unscoped tool id in its audit trail on Pi's
+  authority, which is not Pi's to spend.
+- **A gated tool parks the turn** as `awaiting_approval` with the action stored
+  whole, rather than failing it. The owner has not said no; they have not been
+  asked yet. A restart does not withdraw the question, and `GET /approvals` is
+  one queue across all sessions — an approval nobody sees is an action that
+  silently never happens.
+- **Resuming replays the stored action**, never one rebuilt from the
+  conversation, so an approval cannot be spent on a different action than the
+  one the owner was shown. A stale approval re-parks the turn on the *new*
+  request instead of leaving it behind a dead nonce it could never clear.
+- **An action that happened is never recorded as one that did not.** A tool can
+  succeed and the model can then fail to say so. Those turns are recorded as
+  `acted_no_reply`, not `failed`, and resuming asks only for the missing reply
+  without running the action a second time. Neither route answers with an error
+  status in that case: an error code invites a retry, and retrying would do the
+  thing twice. `GET /turns/unreplied` lists them. Found by a live round trip
+  against ToolGate, where the tool ran, the local model timed out afterwards,
+  and the turn claimed the action had failed.
+- **Timeouts are configuration, and generous locally.** `PI_LOCAL_TIMEOUT_S`
+  defaults to 600s. The previous fixed 120s ceiling fired on a local model that
+  was still thinking and turned *slow* into *failed*.
+- `GET /tools`, `GET /approvals`, `GET /turns/unreplied` and
+  `POST /turns/{id}/resume` are new; `/health` gains an `action_boundary` check.
+  Turns gain `acted`. A database created by an earlier version is migrated in
+  place.
+- **`/health` reported `0.1.0` while the module was at `0.2.0`.** Fixed, and it
+  is the same class of defect as the one above: a status that is quietly wrong.
+
 ## 0.2.0
 
 Provider adapters and routing.

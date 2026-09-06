@@ -19,12 +19,15 @@ how MemoryGate treats evidence.
 """
 from __future__ import annotations
 
+import json
 import time
 
+from . import tools as tool_protocol
 from .openrouter import ModelUnusable
-from .providers import Completion, Message, ProviderUnavailable
+from .providers import Message, ProviderUnavailable
 from .routing import Router, TurnContext
 from .store import Store
+from .toolgate import ApprovalRequired, ToolGateClient, ToolGateUnavailable, ToolRefused
 
 # A turn that would exceed this many characters of history triggers a fork.
 # Characters, not tokens, on purpose: a tokeniser is provider-specific and this
@@ -39,13 +42,51 @@ class TurnFailed(RuntimeError):
         self.reason = reason
 
 
+class ActedWithoutReply(TurnFailed):
+    """The action ran. The reply did not arrive.
+
+    A distinct type because it must not be handled like a failure. Nothing here
+    may be retried as a whole: the approval is spent and the world has already
+    changed, so a caller that retried would either be refused or, worse, do the
+    thing twice. Only the reply is missing, and only the reply may be asked for
+    again - which is what resuming such a turn does.
+    """
+
+    def __init__(self, turn_id: str, cause: str) -> None:
+        super().__init__(f"the action ran, but no reply arrived: {cause}")
+        self.turn_id = turn_id
+        self.cause = cause
+
+
 class Loop:
     def __init__(self, store: Store, router: Router, *, system_prompt: str = "",
-                 fork_threshold_chars: int = DEFAULT_FORK_THRESHOLD_CHARS) -> None:
+                 fork_threshold_chars: int = DEFAULT_FORK_THRESHOLD_CHARS,
+                 toolgate: ToolGateClient | None = None, max_tool_steps: int = 4) -> None:
         self.store = store
         self.router = router
         self.system_prompt = system_prompt
         self.fork_threshold_chars = fork_threshold_chars
+        self.toolgate = toolgate
+        # A ceiling on how many times one turn may act. Not a safety boundary -
+        # ToolGate is that - but a model looping on a failing tool would
+        # otherwise spend indefinitely without ever answering.
+        self.max_tool_steps = max_tool_steps
+
+    def _available_tools(self):
+        """What this key is scoped to right now, or nothing.
+
+        Asked per turn rather than cached: the owner can widen or narrow scope
+        at any moment, and a cached list would let Pi offer the model a tool it
+        no longer has, then explain a refusal it should have predicted.
+        """
+        if self.toolgate is None:
+            return []
+        try:
+            return self.toolgate.tools()
+        except ToolGateUnavailable:
+            # Tools unavailable is not the turn failing. Conversation still
+            # works, and the model is simply offered nothing.
+            return []
 
     def _call(self, messages: list[Message], ctx: TurnContext):
         """Route, then call, falling through models that refuse to serve us.
@@ -69,19 +110,24 @@ class Loop:
 
     # --- context ----------------------------------------------------------
 
-    def _history(self, session_id: str) -> list[Message]:
+    def _history(self, session_id: str, tools=None) -> list[Message]:
         session = self.store.get_session(session_id)
         messages: list[Message] = []
         if self.system_prompt:
             messages.append(Message("system", self.system_prompt))
+        if tools:
+            messages.append(Message("system", tool_protocol.describe(tools)))
         # A forked child carries its parent's summary as context, not its
         # parent's messages. The messages are still there, in the parent, and
         # still readable - they are simply not resent.
         if session and session.get("summary"):
-            messages.append(Message("system", f"Earlier in this conversation:\n{session['summary']}"))
+            messages.append(
+                Message("system", f"Earlier in this conversation:\n{session['summary']}")
+            )
         for row in self.store.messages(session_id):
             content = row["content"]
-            messages.append(Message(row["role"], content if isinstance(content, str) else str(content)))
+            text = content if isinstance(content, str) else str(content)
+            messages.append(Message(row["role"], text))
         return messages
 
     def _history_size(self, messages: list[Message]) -> int:
@@ -121,6 +167,95 @@ class Loop:
             title=parent.get("title", ""), parent_id=session_id, summary=summary,
         )
 
+    # --- resuming a parked turn -------------------------------------------
+
+    def resume_turn(self, turn_id: str) -> dict:
+        """Continue a turn the owner has now approved.
+
+        The stored action is replayed exactly as it was shown to them - same
+        tool, same arguments. Rebuilding it from the conversation instead would
+        risk spending an approval on a different action than the one approved,
+        which is the failure the whole binding exists to prevent.
+
+        A turn that already acted but never got its reply also resumes here, and
+        skips straight to the reply. Its approval is spent, so re-invoking would
+        fail closed at best and run the action twice at worst.
+        """
+        turn = self.store.get_turn(turn_id)
+        if turn is None:
+            raise TurnFailed(f"no such turn: {turn_id}")
+        if turn["status"] not in {"awaiting_approval", "acted_no_reply"}:
+            raise TurnFailed(f"turn {turn_id} is {turn['status']}, not awaiting approval")
+
+        session_id = turn["session_id"]
+        started = time.monotonic()
+        acted = turn["status"] == "acted_no_reply"
+
+        if not acted:
+            if self.toolgate is None:
+                raise TurnFailed("no action boundary is configured")
+            try:
+                outcome = self.toolgate.invoke(turn["approval_tool_id"], turn["approval_args"],
+                                               approval_request_id=turn["approval_request_id"])
+            except (ToolRefused, ToolGateUnavailable) as exc:
+                reason = getattr(exc, "message", None) or getattr(exc, "reason", type(exc).__name__)
+                self.store.finish_turn(turn_id, "failed", detail=reason,
+                                       latency_ms=int((time.monotonic() - started) * 1000))
+                raise TurnFailed(reason) from exc
+
+            if isinstance(outcome, ApprovalRequired):
+                # ToolGate asked again, so the approval did not apply - expired,
+                # or never granted. Saying "done" here would be the worst
+                # possible lie. The turn stays parked, now on the new request:
+                # the old nonce is dead, and keeping it stored would park this
+                # turn forever behind an id nobody can ever approve.
+                self.store.finish_turn(
+                    turn_id, "awaiting_approval",
+                    approval_request_id=outcome.request_id,
+                    approval_tool_id=outcome.tool_id,
+                    approval_args=json.dumps(outcome.args, ensure_ascii=False),
+                    approval_expires_at=outcome.expires_at,
+                    detail=outcome.message,
+                )
+                raise TurnFailed(
+                    "that approval is no longer valid; the action must be confirmed again"
+                )
+
+            observation = json.dumps({"tool": outcome.tool_id, "result": outcome.result},
+                                     ensure_ascii=False)
+            self.store.append_message(session_id, "tool", observation)
+            # The action has happened and the approval is spent. That is written
+            # down now, before anything else is attempted, because everything
+            # after this point can fail and none of it can un-happen the action.
+            self.store.mark_acted(turn_id)
+            acted = True
+
+        available = self._available_tools()
+        history = self._history(session_id, tools=available)
+        ctx = TurnContext(history_chars=self._history_size(history), needs_tools=bool(available))
+        try:
+            route, completion, _skipped = self._call(history, ctx)
+        except (ProviderUnavailable, RuntimeError) as exc:
+            reason = getattr(exc, "reason", type(exc).__name__)
+            # Not "failed". The tool ran, and a record saying otherwise would
+            # tell the owner their action did not happen when it did. Resuming
+            # again asks only for the reply.
+            self.store.finish_turn(turn_id, "acted_no_reply", acted=1, detail=reason,
+                                   latency_ms=int((time.monotonic() - started) * 1000))
+            raise ActedWithoutReply(turn_id, reason) from exc
+
+        message = self.store.append_message(session_id, "assistant", completion.text)
+        self.store.finish_turn(
+            turn_id, "complete", acted=int(acted),
+            provider=completion.provider, model=completion.model,
+            input_tokens=completion.input_tokens, output_tokens=completion.output_tokens,
+            cached_tokens=completion.cached_tokens, cost_usd=completion.cost_usd,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            route_tier=route.tier.value, route_reason=route.reason.value,
+        )
+        return {"session_id": session_id, "turn_id": turn_id, "status": "complete",
+                "acted": True, "message": message}
+
     # --- the turn ---------------------------------------------------------
 
     def run_turn(self, session_id: str, user_text: str, context: dict | None = None) -> dict:
@@ -137,23 +272,89 @@ class Loop:
             raise TurnFailed(f"session {session_id} is {session['status']}, not open")
 
         forked_from = None
-        if self._history_size(self._history(session_id)) + len(user_text) > self.fork_threshold_chars:
+        outgrown = (self._history_size(self._history(session_id)) + len(user_text)
+                    > self.fork_threshold_chars)
+        if outgrown:
             forked_from, session_id = session_id, self.fork(session_id)
 
         self.store.append_message(session_id, "user", user_text)
         turn_id = self.store.start_turn(session_id)
         started = time.monotonic()
-        history = self._history(session_id)
-        ctx = TurnContext(history_chars=self._history_size(history), **(context or {}))
+
+        available = self._available_tools()
+        allowed = {t.id for t in available}
+        acted = False
+        context = dict(context or {})
+        context.setdefault("needs_tools", bool(available))
+        history = self._history(session_id, tools=available)
+        ctx = TurnContext(history_chars=self._history_size(history), **context)
 
         try:
             route, completion, skipped = self._call(history, ctx)
+
+            # Act, then think again, up to a ceiling. Every action goes through
+            # ToolGate; Pi runs nothing itself.
+            for _ in range(self.max_tool_steps):
+                call = tool_protocol.parse(completion.text, allowed)
+                if call is None:
+                    break
+                self.store.append_message(session_id, "assistant", completion.text)
+
+                ran = False
+                try:
+                    outcome = self.toolgate.invoke(call.tool_id, call.args)
+                except ToolRefused as refusal:
+                    # A refusal is an answer. It goes back to the model as an
+                    # observation, never retried with the guard removed.
+                    observation = f"tool {call.tool_id} refused: {refusal.code} - {refusal.message}"
+                except ToolGateUnavailable as exc:
+                    observation = f"tool {call.tool_id} unavailable: {exc.reason}"
+                else:
+                    if isinstance(outcome, ApprovalRequired):
+                        # Park. The owner has not said no - they have not been
+                        # asked yet, and a failed turn would say the wrong thing.
+                        self.store.finish_turn(
+                            turn_id, "awaiting_approval",
+                            provider=completion.provider, model=completion.model,
+                            route_tier=route.tier.value, route_reason=route.reason.value,
+                            latency_ms=int((time.monotonic() - started) * 1000),
+                            approval_request_id=outcome.request_id,
+                            approval_tool_id=outcome.tool_id,
+                            approval_args=json.dumps(outcome.args, ensure_ascii=False),
+                            approval_expires_at=outcome.expires_at,
+                            detail=outcome.message,
+                        )
+                        return {"session_id": session_id, "forked_from": forked_from,
+                                "turn_id": turn_id, "status": "awaiting_approval",
+                                "approval": {"request_id": outcome.request_id,
+                                             "tool_id": outcome.tool_id, "args": outcome.args,
+                                             "expires_at": outcome.expires_at,
+                                             "message": outcome.message},
+                                "message": None}
+                    ran = True
+                    observation = json.dumps({"tool": call.tool_id, "result": outcome.result},
+                                             ensure_ascii=False)
+
+                self.store.append_message(session_id, "tool", observation)
+                if ran:
+                    # Written before the next model call, which can fail.
+                    self.store.mark_acted(turn_id)
+                    acted = True
+                history = self._history(session_id, tools=available)
+                route, completion, skipped = self._call(history, ctx)
         except (ProviderUnavailable, RuntimeError) as exc:
             # The user's message stays. It was said, and a transcript that drops
             # what was said because the answer failed is not a transcript.
-            self.store.finish_turn(turn_id, "failed", detail=getattr(exc, "reason", type(exc).__name__),
-                                   latency_ms=int((time.monotonic() - started) * 1000))
-            raise TurnFailed(getattr(exc, "reason", type(exc).__name__)) from exc
+            reason = getattr(exc, "reason", type(exc).__name__)
+            latency = int((time.monotonic() - started) * 1000)
+            if acted:
+                # A tool already ran in this turn. Whatever then happened to the
+                # model, the world changed, and "failed" would deny it.
+                self.store.finish_turn(turn_id, "acted_no_reply", acted=1,
+                                       detail=reason, latency_ms=latency)
+                raise ActedWithoutReply(turn_id, reason) from exc
+            self.store.finish_turn(turn_id, "failed", detail=reason, latency_ms=latency)
+            raise TurnFailed(reason) from exc
 
         message = self.store.append_message(session_id, "assistant", completion.text)
         self.store.finish_turn(
@@ -164,12 +365,13 @@ class Loop:
             latency_ms=int((time.monotonic() - started) * 1000),
             # Recorded so the policy can be tuned against outcomes rather than
             # opinion: a cheap model that fails and escalates has cost both.
-            route_tier=route.tier.value, route_reason=route.reason.value,
+            route_tier=route.tier.value, route_reason=route.reason.value, acted=int(acted),
             # Which candidates refused, so a model that always refuses is
             # visible in the record rather than only as latency.
             detail="; ".join(skipped) or None,
         )
         return {"session_id": session_id, "forked_from": forked_from, "turn_id": turn_id,
+                "acted": acted,
                 "route": {"tier": route.tier.value, "reason": route.reason.value,
                           "provider": route.provider, "model": route.model,
                           "escalated": route.escalated, "skipped": skipped},

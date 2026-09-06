@@ -147,7 +147,8 @@ class OpenRouterProvider:
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
         try:
-            response = httpx.post(CHAT_URL, json=payload, headers=self._headers(), timeout=self.timeout)
+            response = httpx.post(CHAT_URL, json=payload, headers=self._headers(),
+                                  timeout=self.timeout)
         except Exception as exc:
             raise ProviderUnavailable(type(exc).__name__) from exc
 

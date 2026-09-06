@@ -49,6 +49,14 @@ jobs:
           fi
           echo "all tracked text files are LF"
 
+      - name: Lint
+        # Pinned in requirements-dev.txt and configured in ruff.toml, both
+        # explicit: a lint set that moves between releases produces diffs
+        # nobody asked for. Lint only - adopting `ruff format` would rewrite
+        # every file here, and that is its own deliberate change with its own
+        # commit, not something to fold into an unrelated diff.
+        run: python -m ruff check .
+
       - name: Tests
         run: python -m pytest tests/ --ignore=tests/test_module_contract.py -q
 
