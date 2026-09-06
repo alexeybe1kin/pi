@@ -1,0 +1,49 @@
+# What must never reach an image.
+#
+# Docker's COPY does NOT honour .gitignore. This file is the only thing that
+# stops a local .env or a working database being baked into a published image,
+# and this repository has already been bitten by exactly that: ToolGate keeps
+# its data inside its own package directory, so `COPY toolgate ./toolgate`
+# shipped a developer's real credentials to the registry.
+#
+# Every pattern is anchored with **/ deliberately. A bare `.env` matches only
+# the root of the build context, and the file that leaked was one level down.
+
+# --- secrets and state ---
+**/.env
+**/.env.*
+!**/.env.example
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.sqlite3
+**/vault.key
+**/*.pem
+**/data
+**/backups
+
+# --- version control and CI ---
+.git
+.github
+**/.gitignore
+**/.gitattributes
+
+# --- development only ---
+**/tests
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/node_modules
+**/dist
+**/build
+
+# --- editor noise ---
+**/.vscode
+**/.idea
+**/.DS_Store

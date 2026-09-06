@@ -95,3 +95,38 @@ jobs:
 
       - if: always()
         run: docker compose down -v
+
+  no-secrets-in-the-image:
+    # Docker's COPY does not honour .gitignore, so a local .env or a working
+    # database can be baked into a published image without a single warning.
+    # That has happened here once already, and the fix - a .dockerignore - is
+    # exactly the kind of file that silently stops matching when a path moves.
+    # So the image is built and searched, rather than trusted.
+    #
+    # Scoped to /app on purpose. Searching the whole filesystem for "*.pem"
+    # matches the OS certificate store, several hundred files that are supposed
+    # to be there - and a check that cries wolf is a check somebody turns off.
+    # .env.example is excluded for the same reason: it ships deliberately.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t candidate:ci -f Dockerfile .
+
+      - name: Search it for anything secret
+        run: |
+          found=$(docker run --rm --entrypoint sh candidate:ci -c \
+            'find /app -type f 2>/dev/null' \
+            | grep -Ei '/\.env$|/\.env\.[^/]*$|\.db$|\.sqlite[0-9]?$|vault\.key$|/id_[rd]sa$|\.pem$' \
+            | grep -v '\.env\.example$' || true)
+          if [ -n "$found" ]; then
+            echo "::error::secrets or state were baked into the image" >&2
+            echo "$found" >&2
+            echo "" >&2
+            echo "Fix the .dockerignore at the ROOT OF THE BUILD CONTEXT (not the repo," >&2
+            echo "if those differ). Patterns must be anchored with **/ - a bare '.env'" >&2
+            echo "matches only the context root, never a subdirectory." >&2
+            exit 1
+          fi
+          echo "clean: no .env, no database, no key material under /app"
