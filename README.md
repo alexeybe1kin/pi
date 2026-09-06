@@ -53,8 +53,10 @@ Precedence is **environment → file → default**.
 |---|---|---|
 | `PI_ADMIN_KEY` | *(required)* | At least 16 characters, or Pi will not start. |
 | `PI_DB_PATH` | `/data/pi.db` | Sessions and execution history. **Back this up** — it is the transcript, and MemoryGate's evidence cites message ids from it. |
-| `PI_OLLAMA_URL` | `http://ollama:11434` | Where the model is. |
-| `PI_MODEL` | `qwen3:4b` | The model to talk to. |
+| `PI_OLLAMA_URL` | `http://ollama:11434` | Where the local model is. |
+| `PI_MODEL` | `qwen3:4b` | The local model, used for ordinary conversation. |
+| `PI_OPENROUTER_KEY` | *(empty)* | Optional. Without it Pi answers locally and says so. |
+| `PI_ALLOW_PAID_MODELS` | *(off)* | Opt in to models that cost money. Off means **free only**, enforced in code. |
 | `PI_SYSTEM_PROMPT` | *(empty)* | Prepended to every conversation. |
 
 ## API
@@ -90,11 +92,48 @@ with the reason. Saying nothing would leave the owner looking at a request that 
 `not_configured` is **not** a failure. Nothing is ever `ok` because it was configured — every check
 is probed.
 
+## Routing
+
+Routing is not a feature - it is the cost structure of a system that runs all day. A **local model
+carries ordinary conversation**, and Pi escalates only on explicit signals:
+
+| Signal | Reason recorded |
+|---|---|
+| The owner asked for a stronger model | `owner_asked` |
+| The turn needs tools | `tools_required` |
+| A previous attempt failed | `retry_after_failure` |
+| The work is analysis, not conversation | `analysis` |
+| History has grown large | `long_context` |
+
+Every route is recorded on the turn with its **reason**, because a policy nobody measures drifts
+into always escalating - and `features.md` A6 names the trap directly: a cheap model that fails and
+then escalates has cost both.
+
+The router is deliberately **not** a classifier reading the message. That would be a model nobody
+evaluates deciding what every turn costs. It sees only facts the loop already has, and the caller
+passes what it genuinely knows.
+
+**Free by default.** Models are **discovered, not hardcoded** - a static list is stale within weeks.
+Paid models are refused unless `PI_ALLOW_PAID_MODELS` is set, and a model outside the catalogue is
+refused rather than called blind, so a typo cannot become a bill. An unreadable price counts as
+**not free**, because treating it as zero is exactly the assumption that produces one.
+
+Only text-in, text-out models are routed to. Some zero-priced entries are audio or image generators
+- Google's Lyria outputs `["text", "audio"]` - and routing a conversation into one is a strange
+failure to diagnose from the answer alone.
+
+**Listed and free does not mean callable.** Some free models are gated to particular clients and
+answer `403`. Pi walks its candidate list rather than failing the turn, and **records what it
+skipped** - so a model that always refuses is visible in the record rather than only as latency. A
+bad key or an exhausted quota is *not* treated this way: those fail identically on every candidate,
+and walking the catalogue would be slow and would blame the models.
+
+`GET /models` shows what Pi can route to right now, free and paid, with the count discovered.
+
 ## Not here yet
 
-Provider adapters beyond Ollama, routing and escalation are
-[#28](https://github.com/alexeybe1kin/conker/issues/28). Tool calls through ToolGate are
-[#29](https://github.com/alexeybe1kin/conker/issues/29). Jobs and cron come with C2.
+Tool calls through ToolGate are [#29](https://github.com/alexeybe1kin/conker/issues/29). Jobs and
+cron come with C2.
 
 ## Licence
 

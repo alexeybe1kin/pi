@@ -16,7 +16,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .loop import Loop, TurnFailed
+from .openrouter import OpenRouterProvider
 from .providers import OllamaProvider
+from .routing import Router
 from .store import Store
 
 SERVICE_VERSION = "0.1.0"
@@ -43,14 +45,31 @@ async def lifespan(app: FastAPI):
     # nothing would leave the owner looking at a request that vanished.
     interrupted = store.mark_interrupted_turns()
 
-    provider = OllamaProvider(os.environ.get("PI_OLLAMA_URL", "http://ollama:11434"))
+    local = OllamaProvider(os.environ.get("PI_OLLAMA_URL", "http://ollama:11434"))
+
+    # Free by default: a fresh install works with no payment and no key. The
+    # hosted provider only exists if one was supplied, and even then it refuses
+    # paid models unless PI_ALLOW_PAID_MODELS says otherwise - spending is a
+    # deliberate act, never a default or a typo.
+    openrouter_key = os.environ.get("PI_OPENROUTER_KEY", "").strip()
+    hosted = None
+    if openrouter_key:
+        hosted = OpenRouterProvider(
+            openrouter_key,
+            allow_paid=os.environ.get("PI_ALLOW_PAID_MODELS", "").strip() in {"1", "true", "yes"},
+        )
+
     app.state.admin_key = admin_key
     app.state.store = store
-    app.state.provider = provider
+    app.state.local = local
+    app.state.hosted = hosted
     app.state.interrupted_at_startup = interrupted
+    app.state.router = Router(
+        local_provider=local, hosted_provider=hosted,
+        local_model=os.environ.get("PI_MODEL", "qwen3:4b"),
+    )
     app.state.loop = Loop(
-        store, provider,
-        model=os.environ.get("PI_MODEL", "qwen3:4b"),
+        store, app.state.router,
         system_prompt=os.environ.get("PI_SYSTEM_PROMPT", ""),
     )
     yield
@@ -71,6 +90,12 @@ class NewSession(BaseModel):
 
 class TurnRequest(BaseModel):
     text: str = Field(min_length=1)
+    # Routing hints the caller genuinely knows. The router is deliberately not
+    # a classifier that reads the message - that would be a model nobody
+    # evaluates deciding how much every turn costs.
+    needs_tools: bool = False
+    is_analysis: bool = False
+    owner_requested_strong: bool = False
 
 
 @app.get("/health")
@@ -81,7 +106,15 @@ def health():
     if cached and now - _health_cache["at"] < HEALTH_CACHE_SECONDS:
         return {**cached, "age_seconds": round(now - _health_cache["at"], 1)}
 
-    checks = {"store": app.state.store.health(), "provider": app.state.provider.health()}
+    checks = {
+        "store": app.state.store.health(),
+        "local_provider": app.state.local.health(),
+        # not_configured, not unavailable: no hosted provider is a valid install,
+        # not a broken one, and collapsing the two is how a dashboard starts
+        # lying about what is wrong.
+        "hosted_provider": (app.state.hosted.health() if app.state.hosted
+                            else {"status": "not_configured", "reason": "no API key"}),
+    }
     degraded = sorted(name for name, c in checks.items() if c["status"] not in HEALTHY)
     result = {
         "service": "pi",
@@ -119,11 +152,40 @@ def get_session(session_id: str):
 @app.post("/sessions/{session_id}/turns", dependencies=[Depends(require_key)])
 def run_turn(session_id: str, body: TurnRequest):
     try:
-        return app.state.loop.run_turn(session_id, body.text)
+        return app.state.loop.run_turn(session_id, body.text, context={
+            "needs_tools": body.needs_tools,
+            "is_analysis": body.is_analysis,
+            "owner_requested_strong": body.owner_requested_strong,
+        })
     except TurnFailed as exc:
         # 503, not 500: the provider did not answer, which is a state the caller
         # can act on. The user's message is already stored either way.
         raise HTTPException(503, f"turn failed: {exc.reason}") from exc
+
+
+@app.get("/models", dependencies=[Depends(require_key)])
+def models():
+    """What Pi can route to right now, and what each would cost.
+
+    Discovered, never hardcoded: a static list is stale within weeks. Paid
+    models are listed so the owner can see what opting in would buy, and marked
+    so nothing is called by accident.
+    """
+    local = {"provider": app.state.local.name, "model": app.state.router.local_model,
+             "free": True, "health": app.state.local.health()}
+    if app.state.hosted is None:
+        return {"local": local, "hosted": {"status": "not_configured"}}
+    try:
+        catalogue = app.state.hosted.catalogue()
+    except Exception as exc:
+        return {"local": local,
+                "hosted": {"status": "unavailable", "reason": type(exc).__name__}}
+    free = [m.id for m in app.state.hosted.free_models()]
+    return {"local": local, "hosted": {
+        "status": "ok", "provider": app.state.hosted.name,
+        "allow_paid": app.state.hosted.allow_paid,
+        "free_models": free, "free_count": len(free), "total_text_models": len(catalogue),
+    }}
 
 
 @app.post("/sessions/{session_id}/fork", dependencies=[Depends(require_key)])

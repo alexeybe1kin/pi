@@ -9,8 +9,17 @@ from __future__ import annotations
 import pytest
 
 from pi.loop import Loop, TurnFailed
+from pi.openrouter import ModelUnusable
 from pi.providers import Completion, Message, ProviderUnavailable
+from pi.routing import Router
 from pi.store import Store
+
+
+def loop_with(store, provider, **kwargs):
+    """A loop over a single local provider - the routing policy itself is
+    covered in test_routing.py, so these tests keep it out of the way."""
+    router = Router(local_provider=provider, local_model="test-model")
+    return Loop(store, router, **kwargs)
 
 
 class Recorder:
@@ -41,7 +50,7 @@ def store(tmp_path):
 
 def test_a_turn_appends_the_question_and_the_answer(store):
     provider = Recorder("hello back")
-    loop = Loop(store, provider, model="test-model")
+    loop = loop_with(store, provider)
     s = store.create_session()
 
     result = loop.run_turn(s, "hello")
@@ -54,7 +63,7 @@ def test_a_turn_appends_the_question_and_the_answer(store):
 
 
 def test_the_turn_records_what_it_cost(store):
-    loop = Loop(store, Recorder(), model="test-model")
+    loop = loop_with(store, Recorder())
     s = store.create_session()
     loop.run_turn(s, "hello")
 
@@ -70,7 +79,7 @@ def test_the_turn_records_what_it_cost(store):
 
 def test_history_is_resent_in_order(store):
     provider = Recorder()
-    loop = Loop(store, provider, model="test-model", system_prompt="be brief")
+    loop = loop_with(store, provider, system_prompt="be brief")
     s = store.create_session()
 
     loop.run_turn(s, "first")
@@ -87,7 +96,7 @@ def test_history_is_resent_in_order(store):
 def test_a_failed_turn_keeps_what_the_owner_said(store):
     """The message was said. A transcript that drops it because the answer
     failed is not a transcript, and the owner would retype into a void."""
-    loop = Loop(store, Recorder(fail=True), model="test-model")
+    loop = loop_with(store, Recorder(fail=True))
     s = store.create_session()
 
     with pytest.raises(TurnFailed):
@@ -103,7 +112,7 @@ def test_a_long_conversation_forks_instead_of_being_truncated(store):
     """Dropping the middle would silently lose what was said; rewriting it would
     break append-only. Forking keeps the lineage walkable."""
     provider = Recorder("ok")
-    loop = Loop(store, provider, model="test-model", fork_threshold_chars=200)
+    loop = loop_with(store, provider, fork_threshold_chars=200)
     s = store.create_session(title="long one")
 
     for i in range(12):
@@ -125,7 +134,7 @@ def test_a_long_conversation_forks_instead_of_being_truncated(store):
 
 
 def test_the_child_carries_a_summary_not_the_parents_messages(store):
-    loop = Loop(store, Recorder("ok"), model="test-model", fork_threshold_chars=150)
+    loop = loop_with(store, Recorder("ok"), fork_threshold_chars=150)
     s = store.create_session()
     for i in range(10):
         result = loop.run_turn(s, f"padding padding padding {i}")
@@ -141,7 +150,7 @@ def test_the_child_carries_a_summary_not_the_parents_messages(store):
 def test_forking_still_happens_when_the_summary_cannot_be_written(store):
     """A failed summary must not leave a session that can accept nothing. What
     must not happen is a child claiming context it does not have."""
-    loop = Loop(store, Recorder(fail=True), model="test-model")
+    loop = loop_with(store, Recorder(fail=True))
     s = store.create_session()
     child = loop.fork(s)
 
@@ -152,7 +161,7 @@ def test_forking_still_happens_when_the_summary_cannot_be_written(store):
 
 
 def test_a_closed_session_refuses_new_turns(store):
-    loop = Loop(store, Recorder(), model="test-model")
+    loop = loop_with(store, Recorder())
     s = store.create_session()
     store.close_session(s, "closed")
     with pytest.raises(TurnFailed, match="not open"):
@@ -160,6 +169,68 @@ def test_a_closed_session_refuses_new_turns(store):
 
 
 def test_an_unknown_session_is_refused(store):
-    loop = Loop(store, Recorder(), model="test-model")
+    loop = loop_with(store, Recorder())
     with pytest.raises(TurnFailed, match="no such session"):
         loop.run_turn("ses_nope", "hello?")
+
+
+class GatedHosted:
+    """A hosted provider where the first models refuse to serve this client."""
+
+    name = "openrouter"
+
+    def __init__(self, models, gated):
+        self._models = models
+        self.gated = gated
+        self.asked_for = []
+
+    def free_models(self, *, needs_tools: bool = False):
+        return [_Info(m) for m in self._models]
+
+    def complete(self, messages, *, model):
+        self.asked_for.append(model)
+        if model in self.gated:
+            raise ModelUnusable(f"{model}: HTTP 403")
+        return Completion(text="hosted answer", model=model, provider=self.name)
+
+    def health(self):
+        return {"status": "ok"}
+
+
+class _Info:
+    def __init__(self, mid):
+        self.id = mid
+        self.context_length = 1000
+        self.supports_tools = False
+
+
+def test_a_turn_falls_through_models_that_refuse_and_records_which(store):
+    """Listed and priced at zero does not mean callable. Falling through is not
+    a silent retry - what was skipped is recorded on the turn, so a model that
+    always refuses is visible rather than showing up only as latency."""
+    hosted = GatedHosted(["gated-a", "gated-b", "works"], gated={"gated-a", "gated-b"})
+    router = Router(local_provider=Recorder(), hosted_provider=hosted, local_model="local-m")
+    loop = Loop(store, router)
+    s = store.create_session()
+
+    result = loop.run_turn(s, "analyse this", context={"is_analysis": True})
+
+    assert result["route"]["model"] == "works"
+    assert result["route"]["skipped"] == ["gated-a: HTTP 403", "gated-b: HTTP 403"]
+    assert hosted.asked_for == ["gated-a", "gated-b", "works"]
+    assert "gated-a" in store.turns(s)[0]["detail"]
+
+
+def test_when_every_hosted_model_refuses_the_local_one_answers(store):
+    """A weaker answer beats none, and the record still shows what was tried."""
+    hosted = GatedHosted(["gated-a", "gated-b"], gated={"gated-a", "gated-b"})
+    router = Router(local_provider=Recorder("local answer"), hosted_provider=hosted,
+                    local_model="local-m")
+    loop = Loop(store, router)
+    s = store.create_session()
+
+    result = loop.run_turn(s, "analyse this", context={"is_analysis": True})
+
+    assert result["route"]["provider"] == "recorder"
+    assert result["message"]["content"] == "local answer"
+    assert len(result["route"]["skipped"]) == 2

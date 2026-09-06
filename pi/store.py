@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS turns (
     cached_tokens INTEGER,
     cost_usd      REAL,
     latency_ms    INTEGER,
+    route_tier   TEXT,
+    route_reason TEXT,
     started_at   REAL NOT NULL,
     ended_at     REAL,
     detail       TEXT
@@ -85,6 +87,21 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA foreign_keys=ON")
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        """Add columns a newer Pi expects to a database an older one created.
+
+        CREATE TABLE IF NOT EXISTS silently does nothing when the table already
+        exists, so a new column would be missing on every install that ever ran
+        an earlier version - and the failure would appear as a write error long
+        after the upgrade.
+        """
+        have = {row["name"] for row in db.execute("PRAGMA table_info(turns)")}
+        for column in ("route_tier", "route_reason"):
+            if column not in have:
+                db.execute(f"ALTER TABLE turns ADD COLUMN {column} TEXT")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -176,7 +193,7 @@ class Store:
 
     def finish_turn(self, turn_id: str, status: str, **fields: Any) -> None:
         allowed = {"provider", "model", "input_tokens", "output_tokens", "cached_tokens",
-                   "cost_usd", "latency_ms", "detail"}
+                   "cost_usd", "latency_ms", "detail", "route_tier", "route_reason"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unknown turn fields: {sorted(unknown)}")
