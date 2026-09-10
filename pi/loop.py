@@ -279,6 +279,9 @@ class Loop:
 
         self.store.append_message(session_id, "user", user_text)
         turn_id = self.store.start_turn(session_id)
+        # Held for the whole turn: if this parks on an approval, the owner needs
+        # to see what they asked for next to what it produced.
+        intent = user_text
         started = time.monotonic()
 
         available = self._available_tools()
@@ -322,6 +325,7 @@ class Loop:
                             approval_tool_id=outcome.tool_id,
                             approval_args=json.dumps(outcome.args, ensure_ascii=False),
                             approval_expires_at=outcome.expires_at,
+                            approval_intent=intent,
                             detail=outcome.message,
                         )
                         return {"session_id": session_id, "forked_from": forked_from,
@@ -329,6 +333,7 @@ class Loop:
                                 "approval": {"request_id": outcome.request_id,
                                              "tool_id": outcome.tool_id, "args": outcome.args,
                                              "expires_at": outcome.expires_at,
+                                             "asked": intent,
                                              "message": outcome.message},
                                 "message": None}
                     ran = True

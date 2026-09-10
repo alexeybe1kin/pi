@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS turns (
     approval_tool_id    TEXT,
     approval_args       TEXT,
     approval_expires_at TEXT,
+    -- The owner's own words that started this turn, kept beside the action they
+    -- led to. An approval that shows only what Conker wants to do cannot be
+    -- judged: the question is whether it follows from what was actually asked.
+    -- Anything ingested since is untrusted, so the *owner's* text is the only
+    -- honest anchor to compare against.
+    approval_intent     TEXT,
     -- Whether this turn changed the world. A different fact from whether it
     -- produced a reply, and the one the owner most needs to be true: a tool
     -- that ran and a model that then failed to narrate it is not a turn where
@@ -115,7 +121,8 @@ class Store:
         """
         have = {row["name"] for row in db.execute("PRAGMA table_info(turns)")}
         for column in ("route_tier", "route_reason", "approval_request_id",
-                       "approval_tool_id", "approval_args", "approval_expires_at"):
+                       "approval_tool_id", "approval_args", "approval_expires_at",
+                       "approval_intent"):
             if column not in have:
                 db.execute(f"ALTER TABLE turns ADD COLUMN {column} TEXT")
         if "acted" not in have:
@@ -213,7 +220,7 @@ class Store:
         allowed = {"provider", "model", "input_tokens", "output_tokens", "cached_tokens",
                    "cost_usd", "latency_ms", "detail", "route_tier", "route_reason",
                    "approval_request_id", "approval_tool_id", "approval_args",
-                   "approval_expires_at", "acted"}
+                   "approval_expires_at", "approval_intent", "acted"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unknown turn fields: {sorted(unknown)}")

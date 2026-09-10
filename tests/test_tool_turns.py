@@ -353,3 +353,70 @@ def test_a_stale_approval_reparks_the_turn_on_the_new_request(store):
     assert turn["status"] == "awaiting_approval"
     assert turn["approval_request_id"] == "req_2"
     assert turn["acted"] == 0
+
+
+# --- provenance ------------------------------------------------------------
+#
+# An approval that shows only what Conker wants to do cannot actually be judged.
+# The owner is deciding whether the action *follows from what they asked*, and
+# everything Conker has read since is untrusted - so their own words are the
+# only honest anchor to compare it against. This is the whole defence against
+# an instruction that arrived inside a web page.
+
+
+def test_the_approval_carries_what_the_owner_actually_asked(store):
+    gate = FakeGate(needs_approval=True)
+    loop, _ = build(store, [CALL], gate)
+    s = store.create_session()
+
+    parked = loop.run_turn(s, "summarise today's emails")
+
+    assert parked["approval"]["asked"] == "summarise today's emails"
+    assert store.get_turn(parked["turn_id"])["approval_intent"] == "summarise today's emails"
+
+
+def test_intent_is_the_owner_words_not_the_model_output(store):
+    """The model's own text is the thing being judged. If it authored the
+    provenance too, a manipulated model would write both halves and the
+    mismatch that gives the game away would never appear."""
+    gate = FakeGate(needs_approval=True)
+    loop, _ = build(store, ['{"tool": "t_echo", "args": {"text": "delete everything"}}'], gate)
+    s = store.create_session()
+
+    parked = loop.run_turn(s, "what is the weather")
+
+    assert parked["approval"]["asked"] == "what is the weather"
+    assert "delete" not in parked["approval"]["asked"]
+
+
+def test_a_stale_approval_reparks_without_losing_the_intent(store):
+    """The owner judging an action for the second time is exactly when they are
+    least likely to remember what prompted it.
+
+    This passes today because finish_turn updates only the fields it is given,
+    so an unnamed column keeps its value. That is worth pinning: the property
+    is what matters, and a future rewrite of the park path that clears these
+    fields would break it silently."""
+    gate = FakeGate(needs_approval=True, always_asks=True)
+    loop, _ = build(store, [CALL], gate)
+    s = store.create_session()
+    parked = loop.run_turn(s, "reply to mum about Sunday")
+
+    with pytest.raises(TurnFailed, match="no longer valid"):
+        loop.resume_turn(parked["turn_id"])
+
+    turn = store.get_turn(parked["turn_id"])
+    assert turn["status"] == "awaiting_approval"
+    assert turn["approval_intent"] == "reply to mum about Sunday"
+
+
+def test_the_queue_shows_intent_for_every_parked_turn(store):
+    """The queue is where the owner triages. Intent has to be there, not one
+    click further in."""
+    gate = FakeGate(needs_approval=True)
+    for asked in ("book the gym", "email my teacher"):
+        loop, _ = build(store, [CALL], gate)
+        loop.run_turn(store.create_session(), asked)
+
+    pending = store.awaiting_approval()
+    assert {p["approval_intent"] for p in pending} == {"book the gym", "email my teacher"}
