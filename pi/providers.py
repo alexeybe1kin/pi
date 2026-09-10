@@ -55,6 +55,20 @@ class Provider(Protocol):
     def health(self) -> dict: ...
 
 
+def _installed(wanted: str, models: list[str]) -> bool:
+    """Whether the wanted model is among those Ollama has.
+
+    Ollama reports `qwen3:4b`, and a request for `qwen3` is served by
+    `qwen3:latest` - so a bare name matches any tag of it, while an explicit
+    tag must match exactly. Being lax here would recreate the bug in miniature.
+    """
+    if wanted in models:
+        return True
+    if ":" in wanted:
+        return False
+    return any(name.split(":", 1)[0] == wanted for name in models)
+
+
 class OllamaProvider:
     """Local models over Ollama's chat API.
 
@@ -66,9 +80,12 @@ class OllamaProvider:
 
     name = "ollama"
 
-    def __init__(self, base_url: str, timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 120.0, model: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # Which model this provider is expected to serve, so health can ask
+        # about *that* one rather than about the existence of any model at all.
+        self.model = model
 
     def complete(self, messages: list[Message], *, model: str) -> Completion:
         payload = {
@@ -109,4 +126,11 @@ class OllamaProvider:
         models = [m.get("name", "") for m in response.json().get("models", [])]
         if not models:
             return {"status": "not_configured", "reason": "no models pulled"}
+        # Any model is not the model. An install where the embedding model
+        # downloaded and the chat model did not would otherwise report `ok`
+        # while being unable to answer a single turn - readiness claimed from a
+        # proxy rather than from the thing that actually has to work.
+        if self.model and not _installed(self.model, models):
+            return {"status": "not_configured",
+                    "reason": f"{self.model} is not pulled"}
         return {"status": "ok"}

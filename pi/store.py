@@ -17,10 +17,13 @@ import json
 import sqlite3
 import time
 import uuid
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from .access import MaintenanceRequired, acquire
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -99,16 +102,100 @@ BEGIN
 END;
 """
 
+# A receipt contains identifiers and time, never text or a hash of deleted text.
+FORGETTING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS forgetting_receipts (
+    id TEXT PRIMARY KEY,
+    root_session_id TEXT NOT NULL REFERENCES sessions(id),
+    forgotten_at REAL NOT NULL,
+    confirmation TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    turn_count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forgotten_sessions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    receipt_id TEXT NOT NULL REFERENCES forgetting_receipts(id)
+);
+CREATE TABLE IF NOT EXISTS forgetting_maintenance (
+    id INTEGER PRIMARY KEY CHECK (id=1),
+    root_session_id TEXT NOT NULL,
+    confirmation TEXT NOT NULL
+);
+"""
+
+for _table in ("forgetting_receipts", "forgotten_sessions"):
+    for _operation in ("UPDATE", "DELETE"):
+        FORGETTING_SCHEMA += f"""
+CREATE TRIGGER IF NOT EXISTS {_table}_no_{_operation.lower()}
+BEFORE {_operation} ON {_table}
+BEGIN SELECT RAISE(ABORT, 'forgetting receipts are immutable'); END;
+"""
+
+for _table in ("sessions", "messages", "turns"):
+    _key = "id" if _table == "sessions" else "session_id"
+    for _operation in ("UPDATE", "DELETE"):
+        # The existing message triggers remain unconditional, including after forgetting.
+        if _table == "messages":
+            continue
+        FORGETTING_SCHEMA += f"""
+CREATE TRIGGER IF NOT EXISTS {_table}_forgotten_no_{_operation.lower()}
+BEFORE {_operation} ON {_table}
+WHEN EXISTS (SELECT 1 FROM forgotten_sessions WHERE session_id=OLD.{_key})
+BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
+"""
+    _parent = "parent_id" if _table == "sessions" else "session_id"
+    FORGETTING_SCHEMA += f"""
+CREATE TRIGGER IF NOT EXISTS {_table}_forgotten_no_insert
+BEFORE INSERT ON {_table}
+WHEN EXISTS (SELECT 1 FROM forgotten_sessions WHERE session_id=NEW.{_parent})
+BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
+"""
+
+MESSAGE_LOOKUP = """
+SELECT m.*, r.id AS receipt_id, r.forgotten_at
+FROM messages m
+LEFT JOIN forgotten_sessions f ON f.session_id=m.session_id
+LEFT JOIN forgetting_receipts r ON r.id=f.receipt_id
+"""
+
+
+def _message(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["content"] = json.loads(item["content"])
+    if item["receipt_id"] is None:
+        del item["receipt_id"], item["forgotten_at"]
+    else:
+        item["content_status"] = "forgotten"
+    return item
+
 
 class Store:
     def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
+        self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA foreign_keys=ON")
-            db.executescript(SCHEMA)
-            self._migrate(db)
+        lease = acquire(self.path)
+        self._release = weakref.finalize(self, lease.close)
+        try:
+            with self._connect() as db:
+                if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='forgetting_maintenance'"
+                ).fetchone() and db.execute("SELECT 1 FROM forgetting_maintenance").fetchone():
+                    raise MaintenanceRequired(
+                        "Forgetting cleanup is unfinished. Stop Pi and rerun the same "
+                        "forgetting command before starting it."
+                    )
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA foreign_keys=ON")
+                db.executescript(SCHEMA)
+                self._migrate(db)
+                db.executescript(FORGETTING_SCHEMA)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the lifetime lease only after all turns have stopped."""
+        self._release()
 
     @staticmethod
     def _migrate(db: sqlite3.Connection) -> None:
@@ -130,6 +217,8 @@ class Store:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        if not self._release.alive:
+            raise RuntimeError("Store is closed; create a new Store before using it")
         db = sqlite3.connect(self.path, isolation_level=None, timeout=10.0)
         db.row_factory = sqlite3.Row
         try:
@@ -201,9 +290,15 @@ class Store:
     def messages(self, session_id: str) -> list[dict]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM messages WHERE session_id=? ORDER BY seq", (session_id,)
+                MESSAGE_LOOKUP + " WHERE m.session_id=? ORDER BY m.seq", (session_id,)
             ).fetchall()
-        return [{**dict(r), "content": json.loads(r["content"])} for r in rows]
+        return [_message(r) for r in rows]
+
+    def get_message(self, message_id: str) -> dict | None:
+        """Resolve an evidence citation, including its content-free tombstone."""
+        with self._connect() as db:
+            row = db.execute(MESSAGE_LOOKUP + " WHERE m.id=?", (message_id,)).fetchone()
+        return _message(row) if row else None
 
     # --- turns ------------------------------------------------------------
 
@@ -242,7 +337,9 @@ class Store:
         """
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM turns WHERE status='acted_no_reply' ORDER BY started_at"
+                "SELECT * FROM turns WHERE status='acted_no_reply'"
+                " AND session_id NOT IN (SELECT session_id FROM forgotten_sessions)"
+                " ORDER BY started_at"
             ).fetchall()
         return [{**dict(r), "approval_args": json.loads(r["approval_args"] or "null")}
                 for r in rows]
@@ -268,7 +365,9 @@ class Store:
         """
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM turns WHERE status='awaiting_approval' ORDER BY started_at"
+                "SELECT * FROM turns WHERE status='awaiting_approval'"
+                " AND session_id NOT IN (SELECT session_id FROM forgotten_sessions)"
+                " ORDER BY started_at"
             ).fetchall()
         out = []
         for row in rows:
@@ -309,7 +408,8 @@ class Store:
                 "   ELSE 'the process stopped while this turn was running' END"
                 # Only 'running'. A turn parked on the owner is not interrupted -
                 # it is waiting, and a restart does not withdraw the question.
-                " WHERE status='running'",
+                " WHERE status='running'"
+                " AND session_id NOT IN (SELECT session_id FROM forgotten_sessions)",
                 (time.time(),),
             )
             return cursor.rowcount
