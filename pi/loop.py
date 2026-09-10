@@ -112,6 +112,8 @@ class Loop:
 
     def _history(self, session_id: str, tools=None) -> list[Message]:
         session = self.store.get_session(session_id)
+        if session and session["status"] == "forgotten":
+            raise TurnFailed("session is forgotten; start a new session")
         messages: list[Message] = []
         if self.system_prompt:
             messages.append(Message("system", self.system_prompt))
@@ -188,6 +190,9 @@ class Loop:
             raise TurnFailed(f"turn {turn_id} is {turn['status']}, not awaiting approval")
 
         session_id = turn["session_id"]
+        session = self.store.get_session(session_id)
+        if session and session["status"] == "forgotten":
+            raise TurnFailed("session is forgotten; this turn cannot resume")
         started = time.monotonic()
         acted = turn["status"] == "acted_no_reply"
 

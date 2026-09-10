@@ -96,7 +96,10 @@ async def lifespan(app: FastAPI):
         system_prompt=os.environ.get("PI_SYSTEM_PROMPT", ""),
         toolgate=toolgate,
     )
-    yield
+    try:
+        yield
+    finally:
+        store.close()
 
 
 app = FastAPI(title="Pi", version=SERVICE_VERSION, lifespan=lifespan)
@@ -309,4 +312,15 @@ def models():
 def fork_session(session_id: str):
     if app.state.store.get_session(session_id) is None:
         raise HTTPException(404, "no such session")
-    return {"session_id": app.state.loop.fork(session_id), "parent_id": session_id}
+    try:
+        return {"session_id": app.state.loop.fork(session_id), "parent_id": session_id}
+    except TurnFailed as exc:
+        raise HTTPException(409, exc.reason) from exc
+
+
+@app.get("/messages/{message_id}", dependencies=[Depends(require_key)])
+def get_message(message_id: str):
+    message = app.state.store.get_message(message_id)
+    if message is None:
+        raise HTTPException(404, "no such message")
+    return message

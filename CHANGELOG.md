@@ -4,6 +4,18 @@ Versions are the module's own, not an API revision. A change to the shape of any
 endpoint is a contract change and gets its own entry — replacing a module has to
 be a decision with visible consequences.
 
+## Unreleased
+
+- Add offline, owner-operated forgetting of sessions and their fork descendants,
+  including summaries and approval provenance held by Pi. Runtime history stays
+  append-only; immutable content-free receipts and message envelopes survive.
+- Add authenticated `GET /messages/{id}` for evidence citations. Forgotten sources
+  return explicit tombstones with deletion time and receipt ID. Sessions expose
+  the same tombstones and a new `forgotten` status; their turns cannot resume.
+- Refuse deletion while Pi is running and refuse startup after interrupted
+  database cleanup until the owner retries. Preserve execution outcomes and
+  accounting without retaining conversation payloads.
+
 ## 0.3.0
 
 The action boundary, and the approval round trip.

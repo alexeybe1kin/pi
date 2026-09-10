@@ -21,10 +21,16 @@ boundary whole ([ADR-0001](https://github.com/alexeybe1kin/conker/blob/main/docs
 
 ## Two rules that are structural, not stylistic
 
-**History is append-only.** There is no function that updates or deletes a message, and the schema
+**Runtime history is append-only.** There is no runtime function that updates or deletes a message,
+and the schema
 refuses both with triggers — so a caller reaching past the API still cannot rewrite what was said.
 Current models bind reasoning blocks to the producing model and reject edited history; by the time
 that surfaces, the offending code is everywhere.
+
+The owner can [forget a session and its fork descendants](docs/forgetting.md) through a separate
+offline command. It removes content and derived Pi copies, preserves content-free receipts and
+stable message IDs, and prevents those sessions from resuming. `GET /messages/{id}` resolves a
+deleted source as an explicit tombstone; an unknown ID still returns 404.
 
 **Long conversations fork, they are never truncated.** When history outgrows the window, the session
 closes with a summary and a child opens seeded by it, pointing back at the parent. Dropping the

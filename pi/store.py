@@ -1,9 +1,10 @@
 """Session state and execution history. Pi holds nothing else.
 
 Append-only is enforced here rather than promised in a docstring: there is no
-function that updates or deletes a message, and the schema forbids it with
-triggers, so a future caller cannot quietly rewrite history by reaching past the
-API. Current models bind reasoning blocks to the producing model and reject
+runtime function that updates or deletes a message, and the schema forbids it
+with triggers. The separate offline owner command can redact content atomically,
+leaving identifiers and a receipt; forgotten sessions never resume. Models bind
+reasoning blocks to the producing model and reject
 edited history, and by the time that surfaces the offending code is everywhere.
 
 Transcripts live here and only here. What crosses into MemoryGate is derived
@@ -124,6 +125,15 @@ CREATE TABLE IF NOT EXISTS forgetting_maintenance (
 """
 
 for _table in ("forgetting_receipts", "forgotten_sessions"):
+    _key = "id" if _table == "forgetting_receipts" else "session_id"
+    # SQLite REPLACE can delete without firing DELETE triggers when recursive
+    # triggers are off. Reject duplicate identities before that path is taken.
+    FORGETTING_SCHEMA += f"""
+CREATE TRIGGER IF NOT EXISTS {_table}_no_replace
+BEFORE INSERT ON {_table}
+WHEN EXISTS (SELECT 1 FROM {_table} WHERE {_key}=NEW.{_key})
+BEGIN SELECT RAISE(ABORT, 'forgetting receipts are immutable'); END;
+"""
     for _operation in ("UPDATE", "DELETE"):
         FORGETTING_SCHEMA += f"""
 CREATE TRIGGER IF NOT EXISTS {_table}_no_{_operation.lower()}
@@ -148,6 +158,25 @@ BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
 CREATE TRIGGER IF NOT EXISTS {_table}_forgotten_no_insert
 BEFORE INSERT ON {_table}
 WHEN EXISTS (SELECT 1 FROM forgotten_sessions WHERE session_id=NEW.{_parent})
+BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
+"""
+
+FORGETTING_SCHEMA += """
+CREATE TRIGGER IF NOT EXISTS messages_no_replace
+BEFORE INSERT ON messages
+WHEN EXISTS (SELECT 1 FROM messages WHERE id=NEW.id
+             OR (session_id=NEW.session_id AND seq=NEW.seq))
+BEGIN SELECT RAISE(ABORT, 'messages are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_forgotten_no_replace
+BEFORE INSERT ON sessions
+WHEN EXISTS (SELECT 1 FROM forgotten_sessions WHERE session_id=NEW.id)
+BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
+
+CREATE TRIGGER IF NOT EXISTS turns_forgotten_no_replace
+BEFORE INSERT ON turns
+WHEN EXISTS (SELECT 1 FROM turns t JOIN forgotten_sessions f ON f.session_id=t.session_id
+             WHERE t.id=NEW.id)
 BEGIN SELECT RAISE(ABORT, 'session is forgotten'); END;
 """
 
