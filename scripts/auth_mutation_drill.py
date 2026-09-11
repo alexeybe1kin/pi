@@ -16,7 +16,8 @@ CASES = [
         "tls-identity-changes-on-restart",
         "gateway/__main__.py",
         "        return certificate, key_path\n    key = rsa.generate_private_key",
-        "        certificate.unlink()\n        key_path.unlink()\n    key = rsa.generate_private_key",
+        ("        certificate.unlink()\n        key_path.unlink()\n"
+         "    key = rsa.generate_private_key"),
         (
             "tests/test_gateway_tls.py::"
             "test_tls_identity_survives_restart_and_only_explicit_renewal_replaces_it"
