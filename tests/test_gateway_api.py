@@ -69,6 +69,8 @@ def test_proxy_keeps_credentials_separate_and_preserves_memory_status(gateway):
     assert seen[-1].headers["X-Pi-Gateway-Key"] == RUNTIME
     assert "X-ToolGate-Owner-Key" not in seen[-1].headers
     assert "X-Pi-Key" not in seen[-1].headers and "Cookie" not in seen[-1].headers
+    client.get("/api/pi/sessions")
+    assert "Cookie" not in seen[-1].headers
     result = client.post("/api/owner/requests/req_1/decision", json={"status": "approved"}, headers=headers)
     assert result.status_code == 200
     assert str(seen[-1].url) == "http://toolgate-api:8010/v2/owner/requests/req_1/decision"
@@ -149,3 +151,12 @@ def test_pi_runtime_key_has_no_owner_authority_or_future_admin_access(monkeypatc
             api.require_key(Request({"type": "http", "method": "POST", "path": "/admin/reset", "headers": []}),
                             x_pi_key=None, gateway_key=RUNTIME)
         assert error.value.status_code == 403
+
+
+def test_health_is_honest_when_dependencies_are_unavailable(gateway):
+    client, _, _ = gateway
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "degraded"
+    assert "runtime" in health.json()["degraded"]
+    assert "csrf" not in health.text and OWNER not in health.text

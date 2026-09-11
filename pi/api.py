@@ -39,6 +39,9 @@ _health_cache: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     admin_key = os.environ.get("PI_ADMIN_KEY", "").strip()
+    runtime_hash = os.environ.get("PI_GATEWAY_KEY_SHA256", "").strip()
+    if runtime_hash and (len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash)):
+        raise RuntimeError("Set PI_GATEWAY_KEY_SHA256 to the gateway credential's SHA-256 hex digest, then restart Pi.")
     # Secure by default, or refuse to start. Never fall back to open - the rule
     # has a scar behind it, see ADR-0005.
     if len(admin_key) < 16:
@@ -98,9 +101,6 @@ async def lifespan(app: FastAPI):
     app.state.memory = memory
     memory.start()
     app.state.admin_key = admin_key
-    runtime_hash = os.environ.get("PI_GATEWAY_KEY_SHA256", "").strip()
-    if runtime_hash and (len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash)):
-        raise RuntimeError("Set PI_GATEWAY_KEY_SHA256 to the gateway credential's SHA-256 hex digest, then restart Pi.")
     app.state.gateway_key_hash = runtime_hash
     app.state.store = store
     app.state.local = local
@@ -128,7 +128,7 @@ app = FastAPI(title="Pi", version=SERVICE_VERSION, lifespan=lifespan)
 
 def require_key(request: Request, x_pi_key: str | None = Header(None, alias="X-Pi-Key"),
                 gateway_key: str | None = Header(None, alias="X-Pi-Gateway-Key")) -> str:
-    if x_pi_key and secrets.compare_digest(x_pi_key, app.state.admin_key):
+    if x_pi_key and secrets.compare_digest(x_pi_key.encode(), app.state.admin_key.encode()):
         return "recovery"
     expected = getattr(app.state, "gateway_key_hash", "")
     if (gateway_key and expected and secrets.compare_digest(

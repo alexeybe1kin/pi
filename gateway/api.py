@@ -4,6 +4,7 @@ from __future__ import annotations
 import hmac
 import os
 import re
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -87,13 +88,38 @@ def create_app(config: Config | None = None, *, store: AuthStore | None = None,
         value = auth.session(token, authenticated=authenticated)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             if (request.headers.get("origin") != app.state.config.origin
-                    or not hmac.compare_digest(request.headers.get("x-csrf-token", ""), value["csrf"])):
+                    or not hmac.compare_digest(request.headers.get("x-csrf-token", "").encode(), value["csrf"].encode())):
                 raise AuthError("Request verification failed. Reload Conker and try again.", 403)
         return value
 
     def cookie(response: JSONResponse, token: str) -> JSONResponse:
         response.set_cookie(COOKIE, token, secure=True, httponly=True, samesite="strict", path="/")
         return response
+
+    @app.get("/health")
+    def health():
+        checks = {"owner_login": {"status": "ok" if app.state.auth.configured() else "degraded",
+                                  "reason": "Password configured" if app.state.auth.configured()
+                                  else "Run conker auth setup on the host"}}
+        for name, url, header, key in (
+            ("runtime", app.state.config.pi_url.rstrip("/") + "/health", "X-Pi-Gateway-Key", app.state.config.pi_key),
+            ("owner_channel", app.state.config.toolgate_url.rstrip("/") + "/v2/owner/requests",
+             "X-ToolGate-Owner-Key", app.state.config.owner_key),
+        ):
+            if not key:
+                checks[name] = {"status": "not_configured", "reason": "Provision the owner channel on the host"}
+                continue
+            try:
+                result = upstream("GET", url, header, key, None, b"", timeout=3)
+                value = result.json()
+                status = value.get("status", "unknown") if name == "runtime" else "ok"
+                checks[name] = {"status": status if result.status_code == 200 else "unavailable"}
+            except (httpx.HTTPError, ValueError, AttributeError):
+                checks[name] = {"status": "unavailable"}
+        degraded = sorted(name for name, value in checks.items() if value["status"] not in {"ok", "not_configured"})
+        return {"service": "gateway", "version": "0.1.0", "status": "degraded" if degraded else "ok",
+                "checks": checks, "degraded": degraded, "checked_at": datetime.now(timezone.utc).isoformat(),
+                "age_seconds": 0.0}
 
     @app.get("/auth/session")
     def auth_session(request: Request):
@@ -144,12 +170,19 @@ def create_app(config: Config | None = None, *, store: AuthStore | None = None,
         app.state.auth.revoke()
         return {"revoked": True}
 
+    def upstream(method: str, url: str, key_header: str, key: str, body: dict | None,
+                 query: bytes, *, timeout: float = 660) -> httpx.Response:
+        outgoing = app.state.client.build_request(method, url, headers={key_header: key}, json=body,
+                                                  params=query.decode("ascii") if query else None, timeout=timeout)
+        # A shared HTTP client must not turn a service's Set-Cookie into later authority.
+        outgoing.headers.pop("cookie", None)
+        return app.state.client.send(outgoing)
+
     def forward(method: str, url: str, key_header: str, key: str, body: dict | None, query: bytes):
         if not key:
             raise AuthError("Owner approval channel is not configured. Provision its scoped credential on the host.", 503)
         try:
-            response = app.state.client.request(method, url, headers={key_header: key},
-                                                json=body, params=query.decode("ascii") if query else None)
+            response = upstream(method, url, key_header, key, body, query)
         except (httpx.HTTPError, UnicodeError):
             raise AuthError("Service unavailable; check conker status. The operation was not retried; check its state before repeating it.", 503) from None
         if 300 <= response.status_code < 400:

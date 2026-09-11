@@ -56,7 +56,7 @@ def create_certificate(directory: Path, hostname: str) -> tuple[Path, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Conker browser gateway and host password recovery")
-    parser.add_argument("command", choices=["serve", "setup", "reset-password", "revoke-all", "certificate"])
+    parser.add_argument("command", choices=["serve", "setup", "reset-password", "revoke-all", "certificate", "health"])
     parser.add_argument("--db", default=os.environ.get("GATEWAY_DB_PATH", "/auth/auth.db"))
     parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
@@ -71,6 +71,17 @@ def main() -> None:
         certificate, key = create_certificate(Path(config.database).parent, urlsplit(config.origin).hostname)
         uvicorn.run(create_app(config), host="0.0.0.0", port=args.port,
                     ssl_certfile=str(certificate), ssl_keyfile=str(key), proxy_headers=False)
+    elif args.command == "health":
+        import httpx
+        from .api import Config
+        config = Config.environment()
+        config.validate()
+        # Reach the local listener while retaining the configured TLS name and Host.
+        context = ssl.create_default_context(cafile=str(Path(config.database).parent / "tls.crt"))
+        with httpx.Client(verify=context, trust_env=False, timeout=10) as client:
+            response = client.get("https://localhost:8050/health", headers={"Host": urlsplit(config.origin).netloc})
+            response.raise_for_status()
+            print(response.text)
     elif args.command == "certificate":
         print((Path(args.db).parent / "tls.crt").read_text(), end="")
     else:
