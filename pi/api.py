@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .loop import ActedWithoutReply, Loop, TurnFailed
+from .memory import Memory, MemoryClient
 from .openrouter import OpenRouterProvider
 from .providers import OllamaProvider
 from .routing import Router
@@ -81,6 +82,18 @@ async def lifespan(app: FastAPI):
         timeout=_seconds("PI_TOOLGATE_TIMEOUT_S", 120.0),
     ) if toolgate_key else None
 
+    memory_url = os.environ.get("PI_MEMORYGATE_URL", "").strip()
+    ingest_key = os.environ.get("PI_MEMORYGATE_INGEST_KEY", "").strip()
+    read_key = os.environ.get("PI_MEMORYGATE_READ_KEY", "").strip()
+    if any((memory_url, ingest_key, read_key)) and not all((memory_url, ingest_key, read_key)):
+        store.close()
+        raise RuntimeError("Set PI_MEMORYGATE_URL, PI_MEMORYGATE_INGEST_KEY and "
+                           "PI_MEMORYGATE_READ_KEY together, then restart Pi.")
+    memory = Memory(store, MemoryClient(memory_url, ingest_key, read_key,
+        os.environ.get("PI_MEMORYGATE_AGENT_ID", "default"),
+        timeout=_seconds("PI_MEMORYGATE_TIMEOUT_S", 5.0)) if memory_url else None)
+    app.state.memory = memory
+    memory.start()
     app.state.admin_key = admin_key
     app.state.store = store
     app.state.local = local
@@ -94,11 +107,12 @@ async def lifespan(app: FastAPI):
     app.state.loop = Loop(
         store, app.state.router,
         system_prompt=os.environ.get("PI_SYSTEM_PROMPT", ""),
-        toolgate=toolgate,
+        toolgate=toolgate, memory=memory,
     )
     try:
         yield
     finally:
+        memory.close()
         store.close()
 
 
@@ -154,6 +168,8 @@ def _acted_without_reply(exc: ActedWithoutReply) -> dict:
     and where to ask for it again.
     """
     return {"turn_id": exc.turn_id, "status": "acted_no_reply", "acted": True,
+            "memory": app.state.loop.memory.status(
+                app.state.store.get_turn(exc.turn_id)["session_id"], exc.turn_id),
             "message": None, "detail": exc.cause,
             "hint": f"the action ran and was recorded; POST /turns/{exc.turn_id}/resume "
                     "to ask for the reply again - it will not run the action a second time"}
@@ -169,6 +185,7 @@ def health():
 
     checks = {
         "store": app.state.store.health(),
+        "memory": app.state.loop.memory.health(),
         "local_provider": app.state.local.health(),
         # not_configured, not unavailable: no hosted provider is a valid install,
         # not a broken one, and collapsing the two is how a dashboard starts
@@ -209,7 +226,9 @@ def get_session(session_id: str):
         raise HTTPException(404, "no such session")
     return {**session,
             "messages": app.state.store.messages(session_id),
-            "turns": app.state.store.turns(session_id)}
+            "turns": [{**turn, "memory": app.state.loop.memory.status(session_id, turn["id"])}
+                      for turn in app.state.store.turns(session_id)],
+            "memory": app.state.loop.memory.status(session_id)}
 
 
 @app.post("/sessions/{session_id}/turns", dependencies=[Depends(require_key)])
@@ -229,7 +248,10 @@ def run_turn(session_id: str, body: TurnRequest):
     except TurnFailed as exc:
         # 503, not 500: the provider did not answer, which is a state the caller
         # can act on. The user's message is already stored either way.
-        raise HTTPException(503, f"turn failed: {exc.reason}") from exc
+        raise HTTPException(503, {"message": f"turn failed: {exc.reason}",
+                                  "turn_id": exc.turn_id,
+                                  "memory": app.state.loop.memory.status(
+                                      session_id, exc.turn_id)}) from exc
 
 
 @app.get("/turns/unreplied", dependencies=[Depends(require_key)])
@@ -265,7 +287,8 @@ def resume(turn_id: str):
     except ActedWithoutReply as exc:
         return _acted_without_reply(exc)
     except TurnFailed as exc:
-        raise HTTPException(409, f"cannot resume: {exc.reason}") from exc
+        raise HTTPException(409, {"message": f"cannot resume: {exc.reason}",
+                                  "memory": app.state.loop.memory.status(turn_id=turn_id)}) from exc
 
 
 @app.get("/tools", dependencies=[Depends(require_key)])
@@ -324,3 +347,9 @@ def get_message(message_id: str):
     if message is None:
         raise HTTPException(404, "no such message")
     return message
+
+
+@app.get("/memory", dependencies=[Depends(require_key)])
+def memory_status():
+    """Delivery progress is server state; a model cannot hide this notice."""
+    return app.state.loop.memory.status()

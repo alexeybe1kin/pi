@@ -5,6 +5,9 @@ Conker's runtime. Agent turns, sessions, jobs, model routing, execution history.
 Pi is the only service the browser talks to. Everything the owner sees passes through here, which
 is what keeps provider keys, admin keys and host paths off the client.
 
+Conversation evidence now reaches MemoryGate through a durable outbox. Retrieval and
+delivery gaps are visible independently of model replies. [Setup, forgetting and tests](docs/memory.md).
+
 ## Its boundary
 
 **Pi coordinates and never owns.** It holds **no store beyond session state and execution history**.

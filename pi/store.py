@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from . import memory_store
 from .access import MaintenanceRequired, acquire
 
 SCHEMA = """
@@ -218,6 +219,7 @@ class Store:
                 db.executescript(SCHEMA)
                 self._migrate(db)
                 db.executescript(FORGETTING_SCHEMA)
+                db.executescript(memory_store.SCHEMA)
         except BaseException:
             self.close()
             raise
@@ -303,6 +305,8 @@ class Store:
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         now = time.time()
         with self._connect() as db:
+            # Sequence allocation and the outbox trigger share the message commit.
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE session_id=?",
                 (session_id,),
@@ -313,6 +317,7 @@ class Store:
                 " VALUES (?,?,?,?,?,?)",
                 (message_id, session_id, seq, role, json.dumps(content, ensure_ascii=False), now),
             )
+            db.commit()
         return {"id": message_id, "session_id": session_id, "seq": seq,
                 "role": role, "content": content, "created_at": now}
 

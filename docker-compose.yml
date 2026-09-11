@@ -12,8 +12,8 @@ services:
       PI_DB_PATH: /data/pi.db
       PI_OLLAMA_URL: http://ollama:11434
       # The only way Pi acts on the world. Without PI_TOOLGATE_KEY in .env, Pi
-      # acts on nothing - a working install, not a broken one: it still talks
-      # and still remembers.
+      # acts on nothing. Long-term memory uses the separate PI_MEMORYGATE_*
+      # variables from .env; see docs/memory.md.
       PI_TOOLGATE_URL: http://toolgate-api:8010
     ports:
       # Loopback only. Reached from the owner's devices over Tailscale, never

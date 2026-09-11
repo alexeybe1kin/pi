@@ -17,6 +17,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
+from . import memory_store
 from .access import MaintenanceRequired, acquire
 from .store import FORGETTING_SCHEMA, Store
 
@@ -69,7 +70,8 @@ def _plan(db: sqlite3.Connection, session_id: str) -> dict:
     sessions = [sid for sid in sessions if _receipt(db, sid) is None]
     # The preview binds identifiers, never a digest of the words being forgotten.
     plan = {"root_session_id": session_id, "session_ids": sessions,
-            "message_ids": [], "turn_ids": []}
+            "message_ids": [], "turn_ids": [],
+            "memory_effect": "queue source deletions and clear all cached turn context packages"}
     for sid in sessions:
         for table, field in (("messages", "message_ids"), ("turns", "turn_ids")):
             plan[field].extend(r[0] for r in db.execute(
@@ -115,6 +117,7 @@ def _redact(db: sqlite3.Connection, plan: dict) -> dict:
     try:
         # Transactional DDL keeps the exception invisible to every other connection.
         # The runtime lease prevents a provider response from arriving after deletion.
+        memory_store.redact(db, plan["session_ids"])
         db.execute("DROP TRIGGER messages_are_immutable")
         for sid in plan["session_ids"]:
             db.execute("UPDATE messages SET content='null' WHERE session_id=?", (sid,))
@@ -147,6 +150,7 @@ def forget(path: Path | str, session_id: str, confirmation: str) -> dict:
     with closing(acquire(path, exclusive=True)), closing(_connect(path)) as db:
         Store._migrate(db)
         db.executescript(FORGETTING_SCHEMA)
+        db.executescript(memory_store.SCHEMA)
         db.execute("PRAGMA secure_delete=ON")
         db.execute("BEGIN IMMEDIATE")
         try:

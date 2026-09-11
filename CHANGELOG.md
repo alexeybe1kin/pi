@@ -6,6 +6,13 @@ be a decision with visible consequences.
 
 ## Unreleased
 
+- Commit user evidence and its delivery outbox atomically; retry stable IDs without
+  duplicate MemoryGate records. Serialize concurrent message sequence allocation.
+- Retrieve and retain exact per-turn memory context; expose pending ingestion and
+  retrieval gaps in turn/session responses and authenticated `GET /memory`.
+- Propagate offline forgetting as durable deletions, clear cached contexts and
+  suppress retrieval until MemoryGate acknowledges deletion.
+
 - Add offline, owner-operated forgetting of sessions and their fork descendants,
   including summaries and approval provenance held by Pi. Runtime history stays
   append-only; immutable content-free receipts and message envelopes survive.
