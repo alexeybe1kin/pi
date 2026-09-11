@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import uuid
 
 import httpx
 
@@ -54,6 +55,13 @@ class ToolResult:
     tool_id: str
 
 
+@dataclass(frozen=True)
+class ToolPending:
+    status: str
+    message: str
+    action_id: str
+
+
 class ToolGateUnavailable(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -75,6 +83,10 @@ class ToolRefused(RuntimeError):
 
 
 class ToolGateClient:
+    @staticmethod
+    def new_action_id() -> str:
+        return "pi_" + uuid.uuid4().hex
+
     def __init__(self, base_url: str, execution_key: str, timeout: float = 60.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.execution_key = execution_key
@@ -112,22 +124,23 @@ class ToolGateClient:
     # --- acting ----------------------------------------------------------
 
     def invoke(self, tool_id: str, args: dict,
-               approval_request_id: str | None = None) -> ToolResult | ApprovalRequired:
+               approval_request_id: str | None = None, *, action_id: str,
+               job_id: str | None = None) -> ToolResult | ApprovalRequired | ToolPending:
         """Run a tool, or come back asking for the owner.
 
         Returns ApprovalRequired rather than raising, because being asked to
         confirm is not a failure - the turn parks and the owner decides.
         """
-        payload: dict[str, Any] = {"args": args}
+        payload: dict[str, Any] = {"args": args, "action_id": action_id, "job_id": job_id}
         if approval_request_id:
             payload["approval_request_id"] = approval_request_id
         try:
             response = httpx.post(f"{self.base_url}/v2/tools/{tool_id}/invoke",
                                   json=payload, headers=self._headers(), timeout=self.timeout)
         except Exception as exc:
-            raise ToolGateUnavailable(type(exc).__name__) from exc
+            return ToolPending("outcome_unknown", type(exc).__name__ + ": check the action; do not repeat it", action_id)
 
-        if response.status_code >= 400:
+        if 400 <= response.status_code < 500:
             detail = self._detail(response)
             # 409 APPROVAL_INVALID is what a replayed or expired approval looks
             # like. It is a refusal, never a reason to retry without one.
@@ -135,7 +148,26 @@ class ToolGateClient:
                               detail.get("message", "tool refused"),
                               detail.get("next_action", ""))
 
-        body = response.json()
+        return self._outcome(response, tool_id, args, action_id)
+
+    def check_action(self, action_id: str, tool_id: str) -> ToolResult | ToolPending:
+        try:
+            response = httpx.get(f"{self.base_url}/v2/agent/actions/{action_id}",
+                                 headers=self._headers(), timeout=self.timeout)
+        except httpx.HTTPError:
+            return ToolPending("outcome_unknown", "Action status unavailable; do not repeat it", action_id)
+        return self._outcome(response, tool_id, {}, action_id)
+
+    @staticmethod
+    def _outcome(response, tool_id, args, action_id):
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict) or response.status_code != 200:
+            return ToolPending("outcome_unknown", "Action outcome could not be verified", action_id)
+        if body.get("action_id", action_id) != action_id:
+            return ToolPending("outcome_unknown", "Action receipt identity does not match", action_id)
         if body.get("code") == "CONFIRMATION_REQUIRED":
             return ApprovalRequired(
                 request_id=body["request_id"],
@@ -144,8 +176,20 @@ class ToolGateClient:
                 tool_id=tool_id,
                 args=args,
             )
-        return ToolResult(ok=bool(body.get("ok", True)), result=body.get("result", body),
-                          tool_id=tool_id)
+        if body.get("code") == "IN_PROGRESS":
+            return ToolPending("action_in_progress", "Dispatch recorded; outcome pending", action_id)
+        if body.get("code") == "OUTCOME_UNKNOWN":
+            return ToolPending("outcome_unknown", "Outcome unknown; check the action, never repeat it", action_id)
+        result = body.get("result")
+        if body.get("status") == "completed" and isinstance(result, dict):
+            if body.get("code") == "OK" and result.get("ok") is True:
+                return ToolResult(True, result.get("result"), tool_id)
+            if body.get("code") == "TOOL_UNAVAILABLE" and result.get("ok") is False:
+                return ToolResult(False, result, tool_id)
+        # Compatibility with explicit old receipts; absence or truthy strings are not success.
+        if body.get("ok") is True or body.get("ok") is False:
+            return ToolResult(body["ok"], result, tool_id)
+        return ToolPending("outcome_unknown", "No affirmative or negative execution receipt", action_id)
 
     def health(self) -> dict:
         if not self.execution_key:

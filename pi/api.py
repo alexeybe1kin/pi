@@ -297,14 +297,14 @@ def approvals():
 
 
 @app.post("/turns/{turn_id}/resume", dependencies=[Depends(require_key)])
-def resume(turn_id: str):
+def resume(turn_id: str, body: dict | None = None):
     """Continue a parked turn after the owner approved it in ToolGate.
 
     Pi does not grant approvals and does not hold them. This replays the exact
     stored action; ToolGate consumes the nonce, once, and refuses a replay.
     """
     try:
-        return app.state.loop.resume_turn(turn_id)
+        return app.state.loop.resume_turn(turn_id, job_id=(body or {}).get("job_id"))
     except ActedWithoutReply as exc:
         return _acted_without_reply(exc)
     except TurnFailed as exc:

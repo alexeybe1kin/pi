@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from . import memory_store
+from . import actions, memory_store
 from .access import MaintenanceRequired, acquire
 
 SCHEMA = """
@@ -220,6 +220,7 @@ class Store:
                 self._migrate(db)
                 db.executescript(FORGETTING_SCHEMA)
                 db.executescript(memory_store.SCHEMA)
+                db.executescript(actions.SCHEMA)
         except BaseException:
             self.close()
             raise
@@ -345,7 +346,8 @@ class Store:
             )
         return turn_id
 
-    def finish_turn(self, turn_id: str, status: str, **fields: Any) -> None:
+    def finish_turn(self, turn_id: str, status: str, *, expected_status: str = "running",
+                    **fields: Any) -> bool:
         allowed = {"provider", "model", "input_tokens", "output_tokens", "cached_tokens",
                    "cost_usd", "latency_ms", "detail", "route_tier", "route_reason",
                    "approval_request_id", "approval_tool_id", "approval_args",
@@ -356,10 +358,15 @@ class Store:
         sets = ", ".join(f"{k}=?" for k in fields)
         clause = f", {sets}" if sets else ""
         with self._connect() as db:
-            db.execute(
-                f"UPDATE turns SET status=?, ended_at=?{clause} WHERE id=?",
-                (status, time.time(), *fields.values(), turn_id),
-            )
+            return db.execute(
+                f"UPDATE turns SET status=?, ended_at=?{clause} WHERE id=? AND status=?",
+                (status, time.time(), *fields.values(), turn_id, expected_status),
+            ).rowcount == 1
+
+    def claim_turn(self, turn_id: str, expected_status: str) -> bool:
+        with self._connect() as db:
+            return db.execute("UPDATE turns SET status='running',ended_at=NULL WHERE id=? AND status=?",
+                              (turn_id, expected_status)).rowcount == 1
 
     def acted_without_reply(self) -> list[dict]:
         """Every turn that changed the world but never said what happened.
@@ -371,7 +378,7 @@ class Store:
         """
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM turns WHERE status='acted_no_reply'"
+                "SELECT * FROM turns WHERE (status='acted_no_reply' OR (status='interrupted' AND acted=1))"
                 " AND session_id NOT IN (SELECT session_id FROM forgotten_sessions)"
                 " ORDER BY started_at"
             ).fetchall()
@@ -433,7 +440,9 @@ class Store:
         the owner would see a request that simply vanished."""
         with self._connect() as db:
             cursor = db.execute(
-                "UPDATE turns SET status='interrupted', ended_at=?,"
+                "UPDATE turns SET status=CASE WHEN EXISTS(SELECT 1 FROM tool_actions a "
+                "WHERE a.turn_id=turns.id AND a.state IN ('dispatching','action_in_progress','outcome_unknown')) "
+                "THEN 'outcome_unknown' WHEN acted=1 THEN 'acted_no_reply' ELSE 'interrupted' END, ended_at=?,"
                 # An interrupted turn that had already acted is not the same event
                 # as one that had not, and that difference is the only thing the
                 # owner actually needs from this row.

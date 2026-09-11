@@ -107,12 +107,12 @@ def test_only_scoped_tools_are_visible(client):
 def test_every_request_carries_the_execution_key(client):
     """Not the MCP bridge, which has no identity at all - ADR-0005."""
     client.tools()
-    client.invoke("t_echo", {"a": 1})
+    client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert FakeToolGate.seen_keys and all(k == KEY for k in FakeToolGate.seen_keys)
 
 
 def test_an_ordinary_tool_runs(client):
-    result = client.invoke("t_echo", {"a": 1})
+    result = client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert isinstance(result, ToolResult)
     assert result.ok and result.result == {"echoed": {"a": 1}}
 
@@ -121,7 +121,7 @@ def test_a_gated_tool_asks_rather_than_fails(client):
     """Being asked to confirm is not a failure. The owner has not said no -
     they have not been asked yet, so the turn parks."""
     FakeToolGate.needs_approval = {"t_echo"}
-    outcome = client.invoke("t_echo", {"a": 1})
+    outcome = client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert isinstance(outcome, ApprovalRequired)
     assert outcome.request_id == "req_1"
     assert outcome.tool_id == "t_echo" and outcome.args == {"a": 1}
@@ -129,8 +129,8 @@ def test_a_gated_tool_asks_rather_than_fails(client):
 
 def test_an_approval_lets_the_exact_action_run(client):
     FakeToolGate.needs_approval = {"t_echo"}
-    asked = client.invoke("t_echo", {"a": 1})
-    result = client.invoke("t_echo", {"a": 1}, approval_request_id=asked.request_id)
+    asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
+    result = client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
     assert isinstance(result, ToolResult) and result.ok
 
 
@@ -141,11 +141,11 @@ def test_replaying_an_approval_fails_closed(client):
     could be replayed, every gate in the system would be advisory.
     """
     FakeToolGate.needs_approval = {"t_echo"}
-    asked = client.invoke("t_echo", {"a": 1})
-    client.invoke("t_echo", {"a": 1}, approval_request_id=asked.request_id)
+    asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
+    client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
 
     with pytest.raises(ToolRefused) as exc:
-        client.invoke("t_echo", {"a": 1}, approval_request_id=asked.request_id)
+        client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
     assert exc.value.code == "APPROVAL_INVALID"
 
 
@@ -153,17 +153,17 @@ def test_pi_holds_no_memory_of_a_past_approval(client):
     """There is no always-allow. A second identical action asks again, because
     the approval bound to the first one and was spent on it."""
     FakeToolGate.needs_approval = {"t_echo"}
-    asked = client.invoke("t_echo", {"a": 1})
-    client.invoke("t_echo", {"a": 1}, approval_request_id=asked.request_id)
+    asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
+    client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
 
-    again = client.invoke("t_echo", {"a": 1})
+    again = client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert isinstance(again, ApprovalRequired), "a spent approval must not carry forward"
 
 
 def test_lockdown_is_refused_not_worked_around(client):
     FakeToolGate.lockdown = True
     with pytest.raises(ToolRefused) as exc:
-        client.invoke("t_echo", {"a": 1})
+        client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert exc.value.code == "LOCKED_DOWN"
 
 

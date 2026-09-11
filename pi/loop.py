@@ -22,14 +22,14 @@ from __future__ import annotations
 import json
 import time
 
-from . import memory_store
+from . import actions, memory_store
 from . import tools as tool_protocol
 from .memory import Memory
 from .openrouter import ModelUnusable
 from .providers import Message, ProviderUnavailable
 from .routing import Router, TurnContext
 from .store import Store
-from .toolgate import ApprovalRequired, ToolGateClient, ToolGateUnavailable, ToolRefused
+from .toolgate import ApprovalRequired, ToolGateClient, ToolGateUnavailable, ToolPending, ToolRefused
 
 # A turn that would exceed this many characters of history triggers a fork.
 # Characters, not tokens, on purpose: a tokeniser is provider-specific and this
@@ -184,7 +184,7 @@ class Loop:
 
     # --- resuming a parked turn -------------------------------------------
 
-    def resume_turn(self, turn_id: str) -> dict:
+    def resume_turn(self, turn_id: str, job_id: str | None = None) -> dict:
         """Continue a turn the owner has now approved.
 
         The stored action is replayed exactly as it was shown to them - same
@@ -199,29 +199,56 @@ class Loop:
         turn = self.store.get_turn(turn_id)
         if turn is None:
             raise TurnFailed(f"no such turn: {turn_id}")
-        if turn["status"] not in {"awaiting_approval", "acted_no_reply"}:
+        recoverable = {"awaiting_approval", "acted_no_reply", "action_in_progress", "outcome_unknown"}
+        if turn["acted"] and turn["status"] == "interrupted":
+            recoverable.add("interrupted")
+        if turn["status"] not in recoverable:
             raise TurnFailed(f"turn {turn_id} is {turn['status']}, not awaiting approval")
 
         session_id = turn["session_id"]
         session = self.store.get_session(session_id)
         if session and session["status"] == "forgotten":
             raise TurnFailed("session is forgotten; this turn cannot resume")
+        if not self.store.claim_turn(turn_id, turn["status"]):
+            raise TurnFailed("Another caller already resumed this turn", turn_id)
         started = time.monotonic()
-        acted = turn["status"] == "acted_no_reply"
+        acted = bool(turn["acted"])
+        action = actions.latest(self.store, turn_id)
 
-        if not acted:
+        if turn["status"] in {"awaiting_approval", "action_in_progress", "outcome_unknown"}:
             if self.toolgate is None:
+                self.store.finish_turn(turn_id, turn["status"])
                 raise TurnFailed("no action boundary is configured")
+            if action is None:
+                return self._hold(turn_id, ToolPending("outcome_unknown",
+                    "Legacy turn has no durable action ID; reconcile it before any new dispatch", ""))
             try:
-                outcome = self.toolgate.invoke(turn["approval_tool_id"], turn["approval_args"],
-                                               approval_request_id=turn["approval_request_id"])
+                if turn["status"] == "awaiting_approval":
+                    if job_id:
+                        try:
+                            actions.bind_job(self.store, action["id"], job_id)
+                        except ValueError as exc:
+                            self.store.finish_turn(turn_id, turn["status"])
+                            raise TurnFailed(str(exc), turn_id) from exc
+                        action["job_id"] = job_id
+                    actions.state(self.store, action["id"], "dispatching")
+                    outcome = self.toolgate.invoke(action["tool_id"], action["args"],
+                        approval_request_id=turn["approval_request_id"],
+                        action_id=action["id"], job_id=action["job_id"])
+                else:
+                    outcome = self.toolgate.check_action(action["id"], action["tool_id"])
             except (ToolRefused, ToolGateUnavailable) as exc:
+                actions.state(self.store, action["id"], "refused")
                 reason = getattr(exc, "message", None) or getattr(exc, "reason", type(exc).__name__)
-                self.store.finish_turn(turn_id, "failed", detail=reason,
+                self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed", detail=reason,
                                        latency_ms=int((time.monotonic() - started) * 1000))
                 raise TurnFailed(reason) from exc
 
+            if isinstance(outcome, ToolPending):
+                return self._hold(turn_id, outcome)
+
             if isinstance(outcome, ApprovalRequired):
+                actions.state(self.store, action["id"], "awaiting_approval")
                 # ToolGate asked again, so the approval did not apply - expired,
                 # or never granted. Saying "done" here would be the worst
                 # possible lie. The turn stays parked, now on the new request:
@@ -239,14 +266,11 @@ class Loop:
                     "that approval is no longer valid; the action must be confirmed again"
                 )
 
-            observation = json.dumps({"tool": outcome.tool_id, "result": outcome.result},
-                                     ensure_ascii=False)
-            self.store.append_message(session_id, "tool", observation)
             # The action has happened and the approval is spent. That is written
             # down now, before anything else is attempted, because everything
             # after this point can fail and none of it can un-happen the action.
-            self.store.mark_acted(turn_id)
-            acted = True
+            actions.record(self.store, action, outcome)
+            acted = acted or outcome.ok
 
         available = self._available_tools()
         history = self._history(session_id, tools=available, turn_id=turn_id)
@@ -258,9 +282,11 @@ class Loop:
             # Not "failed". The tool ran, and a record saying otherwise would
             # tell the owner their action did not happen when it did. Resuming
             # again asks only for the reply.
-            self.store.finish_turn(turn_id, "acted_no_reply", acted=1, detail=reason,
+            self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed", acted=int(acted), detail=reason,
                                    latency_ms=int((time.monotonic() - started) * 1000))
-            raise ActedWithoutReply(turn_id, reason) from exc
+            if acted:
+                raise ActedWithoutReply(turn_id, reason) from exc
+            raise TurnFailed(reason, turn_id) from exc
 
         message = self.store.append_message(session_id, "assistant", completion.text)
         self.store.finish_turn(
@@ -272,8 +298,17 @@ class Loop:
             route_tier=route.tier.value, route_reason=route.reason.value,
         )
         return {"session_id": session_id, "turn_id": turn_id, "status": "complete",
-                "acted": True, "message": message,
+                "acted": acted, "message": message,
                 "memory": self.memory.status(session_id, turn_id)}
+
+    def _hold(self, turn_id, outcome):
+        if outcome.action_id:
+            actions.state(self.store, outcome.action_id, outcome.status)
+        self.store.finish_turn(turn_id, outcome.status, detail=outcome.message)
+        turn = self.store.get_turn(turn_id)
+        return {"turn_id": turn_id, "session_id": turn["session_id"], "status": outcome.status,
+                "acted": bool(turn["acted"]), "action_id": outcome.action_id, "message": None,
+                "notice": outcome.message, "memory": self.memory.status(turn["session_id"], turn_id)}
 
     # --- the turn ---------------------------------------------------------
 
@@ -324,16 +359,23 @@ class Loop:
                 self.store.append_message(session_id, "assistant", completion.text)
 
                 ran = False
+                action = actions.prepare(self.store, turn_id, call.tool_id, call.args,
+                                         ToolGateClient.new_action_id())
                 try:
-                    outcome = self.toolgate.invoke(call.tool_id, call.args)
+                    outcome = self.toolgate.invoke(call.tool_id, call.args,
+                                                   action_id=action["id"], job_id=action["job_id"])
                 except ToolRefused as refusal:
+                    actions.state(self.store, action["id"], "refused")
                     # A refusal is an answer. It goes back to the model as an
                     # observation, never retried with the guard removed.
                     observation = f"tool {call.tool_id} refused: {refusal.code} - {refusal.message}"
                 except ToolGateUnavailable as exc:
-                    observation = f"tool {call.tool_id} unavailable: {exc.reason}"
+                    return self._hold(turn_id, ToolPending("outcome_unknown", exc.reason, action["id"]))
                 else:
+                    if isinstance(outcome, ToolPending):
+                        return self._hold(turn_id, outcome)
                     if isinstance(outcome, ApprovalRequired):
+                        actions.state(self.store, action["id"], "awaiting_approval")
                         # Park. The owner has not said no - they have not been
                         # asked yet, and a failed turn would say the wrong thing.
                         self.store.finish_turn(
@@ -351,16 +393,19 @@ class Loop:
                         return {"session_id": session_id, "forked_from": forked_from,
                                 "turn_id": turn_id, "status": "awaiting_approval",
                                 "approval": {"request_id": outcome.request_id,
+                                             "action_id": action["id"],
                                              "tool_id": outcome.tool_id, "args": outcome.args,
                                              "expires_at": outcome.expires_at,
                                              "asked": intent,
                                              "message": outcome.message},
                                 "message": None, "memory": self.memory.status(session_id, turn_id)}
-                    ran = True
+                    actions.record(self.store, action, outcome)
+                    ran = outcome.ok
                     observation = json.dumps({"tool": call.tool_id, "result": outcome.result},
                                              ensure_ascii=False)
 
-                self.store.append_message(session_id, "tool", observation)
+                if actions.latest(self.store, turn_id)["state"] != "completed":
+                    self.store.append_message(session_id, "tool", observation)
                 if ran:
                     # Written before the next model call, which can fail.
                     self.store.mark_acted(turn_id)

@@ -55,7 +55,7 @@ class FakeGate:
             raise ToolGateUnavailable("ConnectError")
         return [Tool("t_echo", "echo", "echoes things", [{"name": "text", "type": "string"}])]
 
-    def invoke(self, tool_id, args, approval_request_id=None):
+    def invoke(self, tool_id, args, approval_request_id=None, *, action_id=None, job_id=None):
         self.invocations.append((tool_id, args, approval_request_id))
         if self.refuse:
             raise ToolRefused(*self.refuse)
