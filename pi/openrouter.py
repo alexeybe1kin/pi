@@ -60,7 +60,7 @@ def _price(pricing: dict, key: str) -> float | None:
             return None
         price = float(value)
         return price if math.isfinite(price) and price >= 0 else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         # An unparseable price is not free. Treating it as zero is exactly the
         # assumption that turns into a bill.
         return None

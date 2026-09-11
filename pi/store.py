@@ -440,7 +440,16 @@ class Store:
             rows = db.execute(
                 "SELECT * FROM turns WHERE session_id=? ORDER BY started_at", (session_id,)
             ).fetchall()
-        return [self.get_turn(r["id"]) for r in rows]
+            action_rows = db.execute(
+                "SELECT a.turn_id,a.id,a.state,a.job_id FROM tool_actions a "
+                "JOIN turns t ON t.id=a.turn_id WHERE t.session_id=? "
+                "AND a.rowid=(SELECT MAX(rowid) FROM tool_actions WHERE turn_id=a.turn_id)",
+                (session_id,),
+            ).fetchall()
+        latest = {row["turn_id"]: {key: row[key] for key in ("id", "state", "job_id")}
+                  for row in action_rows}
+        return [{**dict(row), "approval_args": json.loads(row["approval_args"] or "null"),
+                 "action": latest.get(row["id"])} for row in rows]
 
     def mark_interrupted_turns(self) -> int:
         """Called at startup. A turn that was running when the process died did

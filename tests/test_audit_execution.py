@@ -7,7 +7,7 @@ import httpx
 import pytest
 from test_tool_turns import CALL, FakeGate, build
 
-from pi import actions
+from pi import actions, forgetting
 from pi.loop import TurnFailed
 from pi.providers import ProviderUnavailable
 from pi.store import Store
@@ -54,6 +54,7 @@ def test_id_is_committed_before_dispatch_and_reused_with_owner_job(tmp_path, mon
         ({"ok": "true"}, "outcome_unknown"),
         ({"code": "IN_PROGRESS"}, "action_in_progress"),
         ({"code": "OUTCOME_UNKNOWN"}, "outcome_unknown"),
+        ({"code": "TOOL_UNAVAILABLE", "ok": True}, "outcome_unknown"),
     ],
 )
 def test_ambiguous_receipts_hold_without_claiming_to_have_acted(
@@ -188,3 +189,21 @@ def test_legacy_interrupted_acted_turn_is_in_unreplied_queue(tmp_path):
     assert [row["id"] for row in store.acted_without_reply()] == [turn]
     loop, _ = build(store, ["done earlier"], FakeGate())
     assert loop.resume_turn(turn)["acted"] is True
+
+
+def test_forgetting_removes_durable_tool_arguments_but_keeps_identity(tmp_path):
+    path = tmp_path / "pi.db"
+    store = Store(path)
+    session = store.create_session()
+    turn = store.start_turn(session)
+    actions.prepare(store, turn, "mail", {"text": "private content"}, "durable")
+    store.close()
+    plan = forgetting.preview(path, session)
+    forgetting.forget(path, session, plan["confirmation"])
+    store = Store(path)
+    action = actions.latest(store, turn)
+    assert action["args"] is None and action["id"] == "durable"
+    loop, _ = build(store, [], FakeGate())
+    with pytest.raises(TurnFailed):
+        loop.resume_turn(turn)
+    store.close()

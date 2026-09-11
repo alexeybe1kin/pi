@@ -99,6 +99,8 @@ class ToolGateClient:
             body = response.json()
         except Exception:
             return {}
+        if not isinstance(body, dict):
+            return {"message": "ToolGate refused without a structured reason"}
         detail = body.get("detail", body)
         return detail if isinstance(detail, dict) else {"message": str(detail)}
 
@@ -190,7 +192,8 @@ class ToolGateClient:
             if body.get("code") == "TOOL_UNAVAILABLE" and result.get("ok") is False:
                 return ToolResult(False, result, tool_id)
         # Compatibility with explicit old receipts; absence or truthy strings are not success.
-        if body.get("ok") is True or body.get("ok") is False:
+        if ("code" not in body and "status" not in body
+                and (body.get("ok") is True or body.get("ok") is False)):
             return ToolResult(body["ok"], result, tool_id)
         return ToolPending("outcome_unknown",
                            "No affirmative or negative execution receipt", action_id)

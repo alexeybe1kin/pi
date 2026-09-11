@@ -23,6 +23,8 @@ Only an affirmative execution receipt sets `acted`. The receipt observation and
 acted flag commit together. Resume claims use compare-and-set; a losing caller
 cannot overwrite the winner. Restart makes acted turns available through the
 unreplied queue, and dispatches without a committed receipt require reconciliation.
+Offline forgetting also erases the new action argument copies, retaining IDs and
+outcome metadata so a forgotten action cannot accidentally acquire a new identity.
 
 ## Memory recovery
 
@@ -66,6 +68,22 @@ free. `cost_usd` records valid provider `usage.cost`; absent or invalid reported
 is unknown, including when token prices are zero. This patch does not add the
 inference spending cap or a ledger for every intermediate model call (E3/F10).
 
-Catalogue outages retain the local candidate and record why hosted routing was
-unavailable. Fork summaries stay assistant-authored context, labeled untrusted;
-they are never promoted to system messages.
+Catalogue and hosted completion outages retain the local candidate and record why
+hosted routing was unavailable. A provider-wide failure skips its remaining models.
+Fork summaries stay assistant-authored context, labeled untrusted; they are never
+promoted to system messages.
+
+## Review drills
+
+```sh
+python -m pytest tests/ --ignore=tests/test_module_contract.py -q
+python scripts/audit_mutation_drill.py
+python scripts/memory_mutation_drill.py
+python scripts/auth_mutation_drill.py
+```
+
+The audit drill is in CI. Each drill runs a passing baseline, mutates isolated
+copies, and requires actual test failures. Collection errors, skipped tests and
+surviving mutants fail the drill. Evidence stays under `.test-tmp/`.
+The module HTTP contract suite requires a running container and remains a separate
+CI job; these local tests do not claim a Linux/Docker deployment drill.

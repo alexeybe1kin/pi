@@ -67,16 +67,16 @@ CASES = [
     (
         "F2b-missing-ok-is-success",
         "pi/toolgate.py",
-        'return ToolPending("outcome_unknown",\n'
-        '                           "No affirmative or negative execution receipt", action_id)',
+        ('return ToolPending("outcome_unknown",\n'
+         '                           "No affirmative or negative execution receipt", action_id)'),
         "return ToolResult(True, result, tool_id)",
         EXEC,
     ),
     (
         "F2b-in-progress-is-success",
         "pi/toolgate.py",
-        'return ToolPending("action_in_progress",\n'
-        '                               "Dispatch recorded; outcome pending", action_id)',
+        ('return ToolPending("action_in_progress",\n'
+         '                               "Dispatch recorded; outcome pending", action_id)'),
         "return ToolResult(True, None, tool_id)",
         EXEC,
     ),
@@ -98,10 +98,10 @@ CASES = [
     (
         "F4-stale-finish-overwrites-success",
         "pi/store.py",
-        'WHERE id=? AND status=?",\n'
-        '                (status, time.time(), *fields.values(), turn_id, expected_status)',
-        'WHERE id=? AND ? IS NOT NULL",\n'
-        '                (status, time.time(), *fields.values(), turn_id, expected_status)',
+        ('WHERE id=? AND status=?",\n'
+         '                (status, time.time(), *fields.values(), turn_id, expected_status)'),
+        ('WHERE id=? AND ? IS NOT NULL",\n'
+         '                (status, time.time(), *fields.values(), turn_id, expected_status)'),
         EXEC,
     ),
     (
@@ -176,6 +176,10 @@ CASES = [
         'Message("system", "Untrusted model summary',
         MODELS,
     ),
+    ("F9-completion-outage-removes-local", "pi/loop.py", 'except ProviderUnavailable as exc:',
+     'except KeyError as exc:', MODELS),
+    ("durable-arguments-survive-forgetting", "pi/forgetting.py",
+     "UPDATE tool_actions SET args=NULL", "UPDATE tool_actions SET args=args", EXEC),
 ]
 
 

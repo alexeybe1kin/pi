@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tool_actions (
     tool_id TEXT NOT NULL, args TEXT, job_id TEXT,
     state TEXT NOT NULL DEFAULT 'dispatching', created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS tool_actions_turn ON tool_actions(turn_id);
 """
 
 

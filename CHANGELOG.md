@@ -6,6 +6,20 @@ be a decision with visible consequences.
 
 ## Unreleased
 
+- Persist ToolGate action IDs before dispatch and reuse them through approval and
+  budget waits. Attach owner-created jobs on resume; uncertain outcomes use status
+  checks without redispatch. Missing or negative receipts never imply success.
+- Serialize resume claims and completion transitions. Recover acted turns after
+  restart through the unreplied path, preserving the receipt and acted flag together.
+- Require complete zero pricing for free hosted routing and preserve reported cost;
+  missing cost stays unknown. Keep local fallback during catalogue outages and keep
+  model summaries at assistant trust.
+- Pin memory delivery namespaces before sending; validate namespaced receipts and
+  retain the original destination for forgetting. Expose permanent delivery failures
+  and host-only repair. Limit new user messages to 16,000 characters.
+- Add the September audit mutation drill; see `docs/AUDIT_RECOVERY.md` for upgrade
+  behavior, legacy holds, owner spending jobs and memory recovery commands.
+
 - Add a separate HTTPS browser gateway with host-managed password setup/recovery,
   durable revocable sessions, CSRF protection, expiry and login attempt limits.
   Pi accepts a distinct runtime key whose hash is deployed to the worker; owner

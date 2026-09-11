@@ -108,7 +108,10 @@ class Loop:
         """
         routes = self.router.candidates(ctx)
         skipped: list[str] = []
+        unavailable_providers = set()
         for route in routes:
+            if route.provider in unavailable_providers:
+                continue
             if route.unavailable_reason:
                 skipped.append(route.unavailable_reason)
             provider = self.router.provider_for(route)
@@ -117,6 +120,11 @@ class Loop:
             except ModelUnusable as exc:
                 skipped.append(exc.reason)
                 continue
+            except ProviderUnavailable as exc:
+                # A provider outage or bad key affects all its catalogue models.
+                # Keep the local candidate without repeating the same hosted failure.
+                skipped.append(exc.reason)
+                unavailable_providers.add(route.provider)
         raise ProviderUnavailable(
             "; ".join(skipped) if skipped else "no candidate model could be reached"
         )
