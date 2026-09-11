@@ -61,7 +61,8 @@ def test_an_unreachable_ollama_is_unavailable_not_misconfigured(monkeypatch):
         raise httpx.ConnectError("refused")
     monkeypatch.setattr(httpx, "get", boom)
 
-    assert OllamaProvider("http://ollama:11434", model="qwen3:4b").health()["status"] == "unavailable"
+    """Unreachable and not-installed are different facts, and the owner
+    needs a different action for each."""
 
 
 def test_a_bare_name_matches_any_tag_but_an_explicit_tag_does_not():

@@ -1,6 +1,6 @@
 """Pi's HTTP surface.
 
-The only service the browser talks to. Every route here is Pi's own state -
+The worker API behind the authenticated browser gateway. Every route is Pi's own state -
 sessions, messages, turns - because Pi coordinates and never owns anything else:
 memory belongs to MemoryGate, actions to ToolGate, machine truth to SystemGate.
 Tool calls arrive in #29 and go out through ToolGate, never from here.
@@ -8,12 +8,14 @@ Tool calls arrive in #29 and go out through ToolGate, never from here.
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .loop import ActedWithoutReply, Loop, TurnFailed
@@ -23,6 +25,7 @@ from .providers import OllamaProvider
 from .routing import Router
 from .store import Store
 from .toolgate import ToolGateClient
+from .browser_contract import runtime_allowed
 
 log = logging.getLogger("pi")
 
@@ -95,6 +98,10 @@ async def lifespan(app: FastAPI):
     app.state.memory = memory
     memory.start()
     app.state.admin_key = admin_key
+    runtime_hash = os.environ.get("PI_GATEWAY_KEY_SHA256", "").strip()
+    if runtime_hash and (len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash)):
+        raise RuntimeError("Set PI_GATEWAY_KEY_SHA256 to the gateway credential's SHA-256 hex digest, then restart Pi.")
+    app.state.gateway_key_hash = runtime_hash
     app.state.store = store
     app.state.local = local
     app.state.hosted = hosted
@@ -119,10 +126,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pi", version=SERVICE_VERSION, lifespan=lifespan)
 
 
-def require_key(x_pi_key: str | None = Header(None, alias="X-Pi-Key")) -> str:
-    if x_pi_key != app.state.admin_key:
-        raise HTTPException(401, "missing or invalid X-Pi-Key")
-    return "admin"
+def require_key(request: Request, x_pi_key: str | None = Header(None, alias="X-Pi-Key"),
+                gateway_key: str | None = Header(None, alias="X-Pi-Gateway-Key")) -> str:
+    if x_pi_key and secrets.compare_digest(x_pi_key, app.state.admin_key):
+        return "recovery"
+    expected = getattr(app.state, "gateway_key_hash", "")
+    if (gateway_key and expected and secrets.compare_digest(
+            hashlib.sha256(gateway_key.encode()).hexdigest(), expected)):
+        if not runtime_allowed(request.method, request.url.path):
+            raise HTTPException(403, "Gateway credential cannot perform this operation.")
+        return "gateway-runtime"
+    raise HTTPException(401, "Missing or invalid runtime credential. Check gateway provisioning on the host.")
 
 
 class NewSession(BaseModel):

@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pi ./pi
+COPY gateway ./gateway
 
 EXPOSE 8050
 CMD ["python", "-m", "uvicorn", "pi.api:app", "--host", "0.0.0.0", "--port", "8050"]
