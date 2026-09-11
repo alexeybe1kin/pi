@@ -220,6 +220,7 @@ class Store:
                 self._migrate(db)
                 db.executescript(FORGETTING_SCHEMA)
                 db.executescript(memory_store.SCHEMA)
+                memory_store.migrate(db)
                 db.executescript(actions.SCHEMA)
         except BaseException:
             self.close()
@@ -303,6 +304,9 @@ class Store:
         No update, no delete, no reorder - not because callers are trusted but
         because the functions do not exist and the triggers would refuse them.
         """
+        if role == "user" and (not isinstance(content, str) or
+                               len(content) > memory_store.MAX_CONTENT_CHARACTERS):
+            raise ValueError("Send user text in messages of at most 16000 characters.")
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
         now = time.time()
         with self._connect() as db:

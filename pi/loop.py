@@ -322,6 +322,8 @@ class Loop:
         forks first and runs in the child. Callers are told which session
         answered rather than left to assume it was the one they asked.
         """
+        if len(user_text) > memory_store.MAX_CONTENT_CHARACTERS:
+            raise TurnFailed("Send at most 16000 characters per message; split longer text.")
         session = self.store.get_session(session_id)
         if session is None:
             raise TurnFailed(f"no such session: {session_id}")

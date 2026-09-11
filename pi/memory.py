@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
@@ -20,16 +21,18 @@ class MemoryClient:
             base_url=url.rstrip("/"), timeout=timeout, follow_redirects=False, transport=transport
         )
         self.ingest_headers = {"X-MemoryGate-Conversation-Key": ingest_key, "X-Agent-Id": agent_id}
+        self.agent_id = agent_id
         self.read_headers = {"X-MemoryGate-Key": read_key, "X-Agent-Id": agent_id}
 
-    def deliver(self, operation, message):
+    def deliver(self, operation, message, *, agent_id):
         url = "/runtime/conversation/" + message["id"]
+        headers = {**self.ingest_headers, "X-Agent-Id": agent_id}
         if operation == "delete":
-            response = self.http.delete(url, headers=self.ingest_headers)
+            response = self.http.delete(url, headers=headers)
         else:
             response = self.http.put(
                 url,
-                headers=self.ingest_headers,
+                headers=headers,
                 json={
                     "session_id": message["session_id"],
                     "content": message["content"],
@@ -39,7 +42,9 @@ class MemoryClient:
         response.raise_for_status()
         receipt = response.json()
         allowed = {"deleted"} if operation == "delete" else {"admitted", "filtered", "deleted"}
-        if receipt.get("message_id") != message["id"] or receipt.get("state") not in allowed:
+        expected_id = str(uuid5(NAMESPACE_URL, f"pi:{agent_id}:{message['id']}"))
+        if (receipt.get("id") != expected_id or receipt.get("message_id") != message["id"]
+                or receipt.get("state") not in allowed):
             raise ValueError("MemoryGate did not acknowledge the expected message")
         return {
             key: receipt.get(key)
@@ -115,7 +120,7 @@ class Memory:
         state = self.client.health()
         delivery = self.status()
         if state["status"] == "ok" and (
-            delivery["pending_ingestion"] or delivery["pending_deletion"]
+            delivery["pending_ingestion"] or delivery["pending_deletion"] or delivery["blocked_delivery"]
         ):
             return {"status": "degraded", "reason": "Memory delivery or deletion is pending"}
         return state
@@ -138,16 +143,28 @@ class Memory:
             if message.get("content_status") == "forgotten":
                 operation = "delete"
             try:
-                receipt = self.client.deliver(operation, message)
+                destination = memory_store.pin_destination(self.store, message["id"], self.client.agent_id)
+                if operation == "ingest" and len(message["content"]) > memory_store.MAX_CONTENT_CHARACTERS:
+                    raise ValueError("Saved text exceeds 16000 characters; keep the transcript and "
+                                     "send a shorter new message. This payload cannot be retried.")
+                receipt = self.client.deliver(operation, message, agent_id=destination)
             except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+                code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                permanent = (code is not None and 400 <= code < 500 and code not in {408, 425, 429}
+                             or isinstance(exc, (ValueError, TypeError, KeyError)))
+                error = (f"HTTP {code}: repair MemoryGate authorization or the rejected payload; "
+                         "then stop Pi and use python -m pi.memory_recovery retry."
+                         if code is not None and permanent else
+                         str(exc) if permanent else
+                         type(exc).__name__ + ": MemoryGate unavailable; retry scheduled")
                 with self.store._connect() as db:
                     db.execute(
-                        "UPDATE memory_outbox SET attempts=attempts+1,next_at=?,error=?"
+                        "UPDATE memory_outbox SET attempts=attempts+1,next_at=?,error=?,state=?"
                         " WHERE message_id=? AND operation=? AND state='pending'",
                         (
                             time.time() + min(60, 2 ** min(job["attempts"] + 1, 6)),
-                            type(exc).__name__
-                            + ": check MemoryGate connectivity and credentials; retry scheduled",
+                            error,
+                            "blocked" if permanent else "pending",
                             job["message_id"],
                             job["operation"],
                         ),

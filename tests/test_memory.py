@@ -1,6 +1,7 @@
 """Recovery guarantees, exercised through real SQLite commits and HTTP contracts."""
 
 import json
+from uuid import NAMESPACE_URL, uuid5
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -81,7 +82,8 @@ def test_lost_ack_retries_same_identity_after_restart(tmp_path):
         attempts.append((request.url.path, json.loads(request.content)))
         if len(attempts) == 1:
             raise httpx.ReadTimeout("receiver committed, acknowledgment lost")
-        return httpx.Response(200, json={"message_id": message["id"], "state": "admitted"})
+        return httpx.Response(200, json={"id": str(uuid5(NAMESPACE_URL, f"pi:default:{message['id']}")),
+                                        "message_id": message["id"], "state": "admitted"})
 
     memory = Memory(store, client(receive))
     assert memory.drain_once() == 0
@@ -167,7 +169,8 @@ def test_forgetting_cancels_upload_scrubs_context_and_blocks_recall(tmp_path):
     def receive(request):
         calls.append(request.method)
         assert request.content == b""
-        return httpx.Response(200, json={"message_id": message["id"], "state": "deleted"})
+        return httpx.Response(200, json={"id": str(uuid5(NAMESPACE_URL, f"pi:default:{message['id']}")),
+                                        "message_id": message["id"], "state": "deleted"})
 
     memory = Memory(store, client(receive))
     next_turn = store.start_turn(other)
@@ -217,7 +220,8 @@ def test_shutdown_waits_for_inflight_upload_before_releasing_forgetting_lease(tm
     def receive(request):
         entered.set()
         assert release.wait(5)
-        return httpx.Response(200, json={"message_id": message["id"], "state": "admitted"})
+        return httpx.Response(200, json={"id": str(uuid5(NAMESPACE_URL, f"pi:default:{message['id']}")),
+                                        "message_id": message["id"], "state": "admitted"})
 
     memory = Memory(store, client(receive))
     memory.start()

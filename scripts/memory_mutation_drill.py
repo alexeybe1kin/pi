@@ -15,8 +15,8 @@ CASES = [
     (
         "lost-ack-drops-evidence",
         "pi/memory.py",
-        "SET attempts=attempts+1,next_at=?,error=?",
-        "SET state='sent',attempts=attempts+1,next_at=?,error=?",
+        '"blocked" if permanent else "pending",',
+        '"sent",',
     ),
     ("context-not-used", "pi/loop.py", 'if saved["package"]:', "if False:"),
     (

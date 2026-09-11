@@ -151,7 +151,8 @@ class NewSession(BaseModel):
 
 
 class TurnRequest(BaseModel):
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=16000,
+                      description="Send at most 16000 characters per message; split longer text.")
     # Routing hints the caller genuinely knows. The router is deliberately not
     # a classifier that reads the message - that would be a model nobody
     # evaluates deciding how much every turn costs.
