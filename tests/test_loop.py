@@ -142,8 +142,8 @@ def test_the_child_carries_a_summary_not_the_parents_messages(store):
             break
 
     child = result["session_id"]
-    system_texts = [m.content for m in loop._history(child) if m.role == "system"]
-    assert any("Earlier in this conversation" in t for t in system_texts)
+    summaries = [m for m in loop._history(child) if "Untrusted model summary" in m.content]
+    assert len(summaries) == 1 and summaries[0].role == "assistant"
     assert len(store.messages(child)) < len(store.messages(result["forked_from"]))
 
 

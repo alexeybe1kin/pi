@@ -17,7 +17,9 @@ both numbers move.
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
@@ -32,22 +34,35 @@ CATALOGUE_TTL_SECONDS = 900.0
 class ModelInfo:
     id: str
     context_length: int
-    prompt_usd_per_token: float
-    completion_usd_per_token: float
+    prompt_usd_per_token: float | None
+    completion_usd_per_token: float | None
     supports_tools: bool
+    pricing: dict | None = None
 
     @property
     def is_free(self) -> bool:
-        return self.prompt_usd_per_token == 0.0 and self.completion_usd_per_token == 0.0
+        pricing = self.pricing
+        if not isinstance(pricing, dict) or not {"prompt", "completion", "request"} <= pricing.keys():
+            return False
+        try:
+            # Decimal prevents a tiny positive fee underflowing to float zero.
+            return all(Decimal(str(value)).is_finite() and Decimal(str(value)) == 0
+                       for value in pricing.values())
+        except (InvalidOperation, ValueError):
+            return False
 
 
-def _price(pricing: dict, key: str) -> float:
+def _price(pricing: dict, key: str) -> float | None:
     try:
-        return float(pricing.get(key) or 0.0)
+        value = pricing.get(key)
+        if isinstance(value, bool):
+            return None
+        price = float(value)
+        return price if math.isfinite(price) and price >= 0 else None
     except (TypeError, ValueError):
         # An unparseable price is not free. Treating it as zero is exactly the
         # assumption that turns into a bill.
-        return float("inf")
+        return None
 
 
 class PaidModelRefused(RuntimeError):
@@ -105,6 +120,7 @@ class OpenRouterProvider:
                 prompt_usd_per_token=_price(pricing, "prompt"),
                 completion_usd_per_token=_price(pricing, "completion"),
                 supports_tools="tools" in (entry.get("supported_parameters") or []),
+                pricing=pricing,
             )
         self._catalogue = catalogue
         self._fetched_at = now
@@ -174,10 +190,9 @@ class OpenRouterProvider:
         usage = body.get("usage") or {}
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
-        cost = None
-        if prompt_tokens is not None and completion_tokens is not None:
-            cost = (prompt_tokens * info.prompt_usd_per_token
-                    + completion_tokens * info.completion_usd_per_token)
+        # Reported charges include request fees and provider-side accounting.
+        # A token-price estimate cannot truthfully replace a missing receipt.
+        cost = _price(usage, "cost")
 
         return Completion(
             text=text,

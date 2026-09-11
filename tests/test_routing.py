@@ -47,7 +47,8 @@ class FakeHosted:
 
 
 def free(model_id, ctx=100_000, tools=False):
-    return ModelInfo(model_id, ctx, 0.0, 0.0, tools)
+    return ModelInfo(model_id, ctx, 0.0, 0.0, tools,
+                     {"prompt": "0", "completion": "0", "request": "0"})
 
 
 def paid(model_id, ctx=100_000, tools=True):

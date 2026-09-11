@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from .providers import ProviderUnavailable
+
 
 class Tier(StrEnum):
     LOCAL = "local"      # free, on the box, no network
@@ -38,6 +40,7 @@ class Route:
     reason: Reason
     provider: str
     model: str
+    unavailable_reason: str | None = None
 
     @property
     def escalated(self) -> bool:
@@ -91,6 +94,15 @@ class Router:
         The caller walks this list rather than failing the turn on the first
         refusal, and records which one answered.
         """
+        try:
+            return self._candidates(ctx, limit)
+        except ProviderUnavailable as exc:
+            if self.local is None or not self.local_model:
+                raise
+            return [Route(Tier.LOCAL, self._reason(ctx or TurnContext()), self.local.name,
+                          self.local_model, "Hosted catalogue unavailable: " + exc.reason)]
+
+    def _candidates(self, ctx, limit):
         primary = self.route(ctx)
         routes = [primary]
         if primary.tier is not Tier.LOCAL and self.hosted is not None:
