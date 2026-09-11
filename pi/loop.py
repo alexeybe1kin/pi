@@ -29,7 +29,13 @@ from .openrouter import ModelUnusable
 from .providers import Message, ProviderUnavailable
 from .routing import Router, TurnContext
 from .store import Store
-from .toolgate import ApprovalRequired, ToolGateClient, ToolGateUnavailable, ToolPending, ToolRefused
+from .toolgate import (
+    ApprovalRequired,
+    ToolGateClient,
+    ToolGateUnavailable,
+    ToolPending,
+    ToolRefused,
+)
 
 # A turn that would exceed this many characters of history triggers a fork.
 # Characters, not tokens, on purpose: a tokeniser is provider-specific and this
@@ -202,7 +208,8 @@ class Loop:
         turn = self.store.get_turn(turn_id)
         if turn is None:
             raise TurnFailed(f"no such turn: {turn_id}")
-        recoverable = {"awaiting_approval", "acted_no_reply", "action_in_progress", "outcome_unknown"}
+        recoverable = {"awaiting_approval", "awaiting_budget", "acted_no_reply",
+                       "action_in_progress", "outcome_unknown"}
         if turn["acted"] and turn["status"] == "interrupted":
             recoverable.add("interrupted")
         if turn["status"] not in recoverable:
@@ -218,15 +225,16 @@ class Loop:
         acted = bool(turn["acted"])
         action = actions.latest(self.store, turn_id)
 
-        if turn["status"] in {"awaiting_approval", "action_in_progress", "outcome_unknown"}:
+        if turn["status"] in {"awaiting_approval", "awaiting_budget",
+                              "action_in_progress", "outcome_unknown"}:
             if self.toolgate is None:
                 self.store.finish_turn(turn_id, turn["status"])
                 raise TurnFailed("no action boundary is configured")
             if action is None:
                 return self._hold(turn_id, ToolPending("outcome_unknown",
-                    "Legacy turn has no durable action ID; reconcile it before any new dispatch", ""))
+                    "Legacy action ID missing; reconcile before any new dispatch", ""))
             try:
-                if turn["status"] == "awaiting_approval":
+                if turn["status"] in {"awaiting_approval", "awaiting_budget"}:
                     if job_id:
                         try:
                             actions.bind_job(self.store, action["id"], job_id)
@@ -241,11 +249,17 @@ class Loop:
                 else:
                     outcome = self.toolgate.check_action(action["id"], action["tool_id"])
             except (ToolRefused, ToolGateUnavailable) as exc:
+                if isinstance(exc, ToolRefused) and exc.code == "BUDGET_DENIED":
+                    return self._hold(turn_id, ToolPending("awaiting_budget",
+                        "Owner spending configuration required: " + exc.message, action["id"]))
                 actions.state(self.store, action["id"], "refused")
                 reason = getattr(exc, "message", None) or getattr(exc, "reason", type(exc).__name__)
-                self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed", detail=reason,
+                self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed",
+                                       detail=reason,
                                        latency_ms=int((time.monotonic() - started) * 1000))
-                raise TurnFailed(reason) from exc
+                if acted:
+                    raise ActedWithoutReply(turn_id, reason) from exc
+                raise TurnFailed(reason, turn_id) from exc
 
             if isinstance(outcome, ToolPending):
                 return self._hold(turn_id, outcome)
@@ -285,7 +299,8 @@ class Loop:
             # Not "failed". The tool ran, and a record saying otherwise would
             # tell the owner their action did not happen when it did. Resuming
             # again asks only for the reply.
-            self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed", acted=int(acted), detail=reason,
+            self.store.finish_turn(turn_id, "acted_no_reply" if acted else "failed",
+                                   acted=int(acted), detail=reason,
                                    latency_ms=int((time.monotonic() - started) * 1000))
             if acted:
                 raise ActedWithoutReply(turn_id, reason) from exc
@@ -310,8 +325,10 @@ class Loop:
         self.store.finish_turn(turn_id, outcome.status, detail=outcome.message)
         turn = self.store.get_turn(turn_id)
         return {"turn_id": turn_id, "session_id": turn["session_id"], "status": outcome.status,
-                "acted": bool(turn["acted"]), "action_id": outcome.action_id, "message": None,
-                "notice": outcome.message, "memory": self.memory.status(turn["session_id"], turn_id)}
+                "acted": bool(turn["acted"]), "action_id": outcome.action_id,
+                "message": None,
+                "notice": outcome.message,
+                "memory": self.memory.status(turn["session_id"], turn_id)}
 
     # --- the turn ---------------------------------------------------------
 
@@ -370,12 +387,17 @@ class Loop:
                     outcome = self.toolgate.invoke(call.tool_id, call.args,
                                                    action_id=action["id"], job_id=action["job_id"])
                 except ToolRefused as refusal:
+                    if refusal.code == "BUDGET_DENIED":
+                        return self._hold(turn_id, ToolPending("awaiting_budget",
+                            "Owner spending configuration required: " + refusal.message,
+                            action["id"]))
                     actions.state(self.store, action["id"], "refused")
                     # A refusal is an answer. It goes back to the model as an
                     # observation, never retried with the guard removed.
                     observation = f"tool {call.tool_id} refused: {refusal.code} - {refusal.message}"
                 except ToolGateUnavailable as exc:
-                    return self._hold(turn_id, ToolPending("outcome_unknown", exc.reason, action["id"]))
+                    return self._hold(turn_id, ToolPending("outcome_unknown",
+                                                          exc.reason, action["id"]))
                 else:
                     if isinstance(outcome, ToolPending):
                         return self._hold(turn_id, outcome)

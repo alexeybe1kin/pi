@@ -130,7 +130,8 @@ def test_a_gated_tool_asks_rather_than_fails(client):
 def test_an_approval_lets_the_exact_action_run(client):
     FakeToolGate.needs_approval = {"t_echo"}
     asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
-    result = client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
+    result = client.invoke("t_echo", {"a": 1}, action_id="test-action",
+                      approval_request_id=asked.request_id)
     assert isinstance(result, ToolResult) and result.ok
 
 
@@ -142,10 +143,12 @@ def test_replaying_an_approval_fails_closed(client):
     """
     FakeToolGate.needs_approval = {"t_echo"}
     asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
-    client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
+    client.invoke("t_echo", {"a": 1}, action_id="test-action",
+                      approval_request_id=asked.request_id)
 
     with pytest.raises(ToolRefused) as exc:
-        client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
+        client.invoke("t_echo", {"a": 1}, action_id="test-action",
+                      approval_request_id=asked.request_id)
     assert exc.value.code == "APPROVAL_INVALID"
 
 
@@ -154,7 +157,8 @@ def test_pi_holds_no_memory_of_a_past_approval(client):
     the approval bound to the first one and was spent on it."""
     FakeToolGate.needs_approval = {"t_echo"}
     asked = client.invoke("t_echo", {"a": 1}, action_id="test-action")
-    client.invoke("t_echo", {"a": 1}, action_id="test-action", approval_request_id=asked.request_id)
+    client.invoke("t_echo", {"a": 1}, action_id="test-action",
+                      approval_request_id=asked.request_id)
 
     again = client.invoke("t_echo", {"a": 1}, action_id="test-action")
     assert isinstance(again, ApprovalRequired), "a spent approval must not carry forward"

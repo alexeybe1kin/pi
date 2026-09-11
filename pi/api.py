@@ -161,6 +161,10 @@ class TurnRequest(BaseModel):
     owner_requested_strong: bool = False
 
 
+class ResumeRequest(BaseModel):
+    job_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
 def _seconds(name: str, default: float) -> float:
     """A timeout from the environment, or the default if it is not a number.
 
@@ -298,14 +302,14 @@ def approvals():
 
 
 @app.post("/turns/{turn_id}/resume", dependencies=[Depends(require_key)])
-def resume(turn_id: str, body: dict | None = None):
+def resume(turn_id: str, body: ResumeRequest | None = None):
     """Continue a parked turn after the owner approved it in ToolGate.
 
     Pi does not grant approvals and does not hold them. This replays the exact
     stored action; ToolGate consumes the nonce, once, and refuses a replay.
     """
     try:
-        return app.state.loop.resume_turn(turn_id, job_id=(body or {}).get("job_id"))
+        return app.state.loop.resume_turn(turn_id, job_id=body.job_id if body else None)
     except ActedWithoutReply as exc:
         return _acted_without_reply(exc)
     except TurnFailed as exc:

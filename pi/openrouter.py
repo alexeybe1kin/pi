@@ -16,8 +16,8 @@ both numbers move.
 """
 from __future__ import annotations
 
-import time
 import math
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
@@ -42,7 +42,8 @@ class ModelInfo:
     @property
     def is_free(self) -> bool:
         pricing = self.pricing
-        if not isinstance(pricing, dict) or not {"prompt", "completion", "request"} <= pricing.keys():
+        required = {"prompt", "completion", "request"}
+        if not isinstance(pricing, dict) or not required <= pricing.keys():
             return False
         try:
             # Decimal prevents a tiny positive fee underflowing to float zero.
@@ -157,7 +158,7 @@ class OpenRouterProvider:
         return info
 
     def complete(self, messages: list[Message], *, model: str) -> Completion:
-        info = self._guard_cost(model)
+        self._guard_cost(model)
         payload = {
             "model": model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],

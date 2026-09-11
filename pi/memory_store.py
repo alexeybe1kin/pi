@@ -39,7 +39,8 @@ def migrate(db):
     if "destination_agent_id" not in columns:
         db.execute("BEGIN IMMEDIATE")
         db.execute("ALTER TABLE memory_outbox ADD COLUMN destination_agent_id TEXT")
-        db.execute("ALTER TABLE memory_outbox ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 0")
+        db.execute("ALTER TABLE memory_outbox "
+                   "ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 0")
         # Older failed requests may have committed remotely before losing the ACK.
         # Neither the current config nor an empty receipt proves their destination.
         db.execute("UPDATE memory_outbox SET delivery_started=1 "

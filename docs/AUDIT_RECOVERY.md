@@ -6,6 +6,13 @@ reuse that identity and the saved arguments. The approval response exposes
 be attached with `POST /turns/{turn_id}/resume`, body `{"job_id":"..."}`.
 Pi never creates spending jobs or obtains an owner-control credential.
 
+`BUDGET_DENIED` parks an action as `awaiting_budget`, even when it has no approval
+requirement. The response's `action_id` (also visible in session turn metadata)
+lets the owner create the correctly bound job, repair pricing or policy, and
+explicitly resume. Job attachment cannot replace an existing different job, and
+it is unavailable once dispatch has become uncertain. The model cannot retry its
+way around a budget denial. The browser spending editor remains separate work.
+
 An ambiguous response parks the turn as `outcome_unknown` or
 `action_in_progress`, with a notice in the API response. Resume checks ToolGate's
 scoped action receipt using GET; it never dispatches the action again. A missing

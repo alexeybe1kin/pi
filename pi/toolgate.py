@@ -5,10 +5,8 @@ beyond the four services and the model providers. If it touches anything outside
 Pi's own store it goes through here, and here goes through ToolGate's keyed HTTP
 API with a scoped execution key.
 
-Not the stdio MCP bridge. That bridge imports the control plane in-process,
-hardcodes a single actor and never checks scope, which makes it a fine
-convenience for one operator at a terminal and an unsafe attachment point for an
-agent. See ADR-0005.
+Pi uses the scoped HTTP execution channel directly, without an owner-control or
+operator-console credential. See ADR-0005.
 
 Approval is ToolGate's to grant, never Pi's to remember. Pi holds no cache of
 past approvals, widens none, and carries none across turns: an approval binds to
@@ -19,9 +17,9 @@ story that is not true.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any
-import uuid
 
 import httpx
 
@@ -138,7 +136,8 @@ class ToolGateClient:
             response = httpx.post(f"{self.base_url}/v2/tools/{tool_id}/invoke",
                                   json=payload, headers=self._headers(), timeout=self.timeout)
         except Exception as exc:
-            return ToolPending("outcome_unknown", type(exc).__name__ + ": check the action; do not repeat it", action_id)
+            return ToolPending("outcome_unknown",
+                               type(exc).__name__ + ": check action; do not repeat", action_id)
 
         if 400 <= response.status_code < 500:
             detail = self._detail(response)
@@ -155,7 +154,8 @@ class ToolGateClient:
             response = httpx.get(f"{self.base_url}/v2/agent/actions/{action_id}",
                                  headers=self._headers(), timeout=self.timeout)
         except httpx.HTTPError:
-            return ToolPending("outcome_unknown", "Action status unavailable; do not repeat it", action_id)
+            return ToolPending("outcome_unknown",
+                               "Action status unavailable; do not repeat it", action_id)
         return self._outcome(response, tool_id, {}, action_id)
 
     @staticmethod
@@ -167,8 +167,9 @@ class ToolGateClient:
         if not isinstance(body, dict) or response.status_code != 200:
             return ToolPending("outcome_unknown", "Action outcome could not be verified", action_id)
         if body.get("action_id", action_id) != action_id:
-            return ToolPending("outcome_unknown", "Action receipt identity does not match", action_id)
-        if body.get("code") == "CONFIRMATION_REQUIRED":
+            return ToolPending("outcome_unknown",
+                               "Action receipt identity does not match", action_id)
+        if body.get("code") == "CONFIRMATION_REQUIRED" and isinstance(body.get("request_id"), str):
             return ApprovalRequired(
                 request_id=body["request_id"],
                 expires_at=body.get("expires_at"),
@@ -177,9 +178,11 @@ class ToolGateClient:
                 args=args,
             )
         if body.get("code") == "IN_PROGRESS":
-            return ToolPending("action_in_progress", "Dispatch recorded; outcome pending", action_id)
+            return ToolPending("action_in_progress",
+                               "Dispatch recorded; outcome pending", action_id)
         if body.get("code") == "OUTCOME_UNKNOWN":
-            return ToolPending("outcome_unknown", "Outcome unknown; check the action, never repeat it", action_id)
+            return ToolPending("outcome_unknown",
+                               "Outcome unknown; check the action, never repeat it", action_id)
         result = body.get("result")
         if body.get("status") == "completed" and isinstance(result, dict):
             if body.get("code") == "OK" and result.get("ok") is True:
@@ -189,7 +192,8 @@ class ToolGateClient:
         # Compatibility with explicit old receipts; absence or truthy strings are not success.
         if body.get("ok") is True or body.get("ok") is False:
             return ToolResult(body["ok"], result, tool_id)
-        return ToolPending("outcome_unknown", "No affirmative or negative execution receipt", action_id)
+        return ToolPending("outcome_unknown",
+                           "No affirmative or negative execution receipt", action_id)
 
     def health(self) -> dict:
         if not self.execution_key:

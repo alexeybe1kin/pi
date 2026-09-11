@@ -1,4 +1,5 @@
 """Host-only repair of delivery metadata; never exposed to the model or browser."""
+
 import argparse
 import json
 import sqlite3
@@ -27,18 +28,27 @@ def repair(path, message_id, *, agent_id=None):
             receipt = json.loads(row["receipt"] or "{}")
             expected = str(uuid5(NAMESPACE_URL, f"pi:{agent_id}:{message_id}"))
             if receipt.get("id") and receipt["id"] != expected:
-                raise ValueError("Agent ID contradicts the saved receipt; find the original deployment config.")
-            db.execute("UPDATE memory_outbox SET destination_agent_id=? WHERE message_id=?",
-                       (agent_id, message_id))
+                raise ValueError(
+                    "Agent ID contradicts the saved receipt; find the original deployment config."
+                )
+            db.execute(
+                "UPDATE memory_outbox SET destination_agent_id=? WHERE message_id=?",
+                (agent_id, message_id),
+            )
         elif row["destination_agent_id"] is None and row["delivery_started"]:
             raise ValueError("Original destination is unknown; run bind-origin first.")
-        db.execute("UPDATE memory_outbox SET state='pending',next_at=0,error='' "
-                   "WHERE message_id=? AND state='blocked'", (message_id,))
+        db.execute(
+            "UPDATE memory_outbox SET state='pending',next_at=0,error='' "
+            "WHERE message_id=? AND state='blocked'",
+            (message_id,),
+        )
         db.commit()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stop Pi before repairing memory delivery metadata.")
+    parser = argparse.ArgumentParser(
+        description="Stop Pi before repairing memory delivery metadata."
+    )
     parser.add_argument("--db", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("bind-origin", "retry"):
@@ -51,7 +61,10 @@ def main():
         repair(args.db, args.message_id, agent_id=getattr(args, "agent_id", None))
     except (ValueError, RuntimeError, sqlite3.Error) as exc:
         parser.exit(1, str(exc) + "\n")
-    print("Delivery metadata repaired. Start Pi to retry; deletion is complete only after its receipt arrives.")
+    print(
+        "Delivery metadata repaired. Start Pi to retry; "
+        "deletion is complete only after its receipt arrives."
+    )
 
 
 if __name__ == "__main__":

@@ -369,7 +369,8 @@ class Store:
 
     def claim_turn(self, turn_id: str, expected_status: str) -> bool:
         with self._connect() as db:
-            return db.execute("UPDATE turns SET status='running',ended_at=NULL WHERE id=? AND status=?",
+            return db.execute("UPDATE turns SET status='running',ended_at=NULL "
+                              "WHERE id=? AND status=?",
                               (turn_id, expected_status)).rowcount == 1
 
     def acted_without_reply(self) -> list[dict]:
@@ -382,7 +383,8 @@ class Store:
         """
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM turns WHERE (status='acted_no_reply' OR (status='interrupted' AND acted=1))"
+                "SELECT * FROM turns WHERE (status='acted_no_reply' "
+                "OR (status='interrupted' AND acted=1))"
                 " AND session_id NOT IN (SELECT session_id FROM forgotten_sessions)"
                 " ORDER BY started_at"
             ).fetchall()
@@ -428,6 +430,9 @@ class Store:
             return None
         item = dict(row)
         item["approval_args"] = json.loads(item["approval_args"] or "null")
+        latest = actions.latest(self, turn_id)
+        item["action"] = ({key: latest[key] for key in ("id", "state", "job_id")}
+                          if latest else None)
         return item
 
     def turns(self, session_id: str) -> list[dict]:
@@ -435,8 +440,7 @@ class Store:
             rows = db.execute(
                 "SELECT * FROM turns WHERE session_id=? ORDER BY started_at", (session_id,)
             ).fetchall()
-        return [{**dict(r), "approval_args": json.loads(r["approval_args"] or "null")}
-                for r in rows]
+        return [self.get_turn(r["id"]) for r in rows]
 
     def mark_interrupted_turns(self) -> int:
         """Called at startup. A turn that was running when the process died did
@@ -445,8 +449,10 @@ class Store:
         with self._connect() as db:
             cursor = db.execute(
                 "UPDATE turns SET status=CASE WHEN EXISTS(SELECT 1 FROM tool_actions a "
-                "WHERE a.turn_id=turns.id AND a.state IN ('dispatching','action_in_progress','outcome_unknown')) "
-                "THEN 'outcome_unknown' WHEN acted=1 THEN 'acted_no_reply' ELSE 'interrupted' END, ended_at=?,"
+                "WHERE a.turn_id=turns.id "
+                "AND a.state IN ('dispatching','action_in_progress','outcome_unknown')) "
+                "THEN 'outcome_unknown' WHEN acted=1 THEN 'acted_no_reply' "
+                "ELSE 'interrupted' END, ended_at=?,"
                 # An interrupted turn that had already acted is not the same event
                 # as one that had not, and that difference is the only thing the
                 # owner actually needs from this row.

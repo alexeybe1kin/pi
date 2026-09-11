@@ -120,7 +120,8 @@ class Memory:
         state = self.client.health()
         delivery = self.status()
         if state["status"] == "ok" and (
-            delivery["pending_ingestion"] or delivery["pending_deletion"] or delivery["blocked_delivery"]
+            delivery["pending_ingestion"] or delivery["pending_deletion"]
+            or delivery["blocked_delivery"]
         ):
             return {"status": "degraded", "reason": "Memory delivery or deletion is pending"}
         return state
@@ -143,14 +144,18 @@ class Memory:
             if message.get("content_status") == "forgotten":
                 operation = "delete"
             try:
-                destination = memory_store.pin_destination(self.store, message["id"], self.client.agent_id)
-                if operation == "ingest" and len(message["content"]) > memory_store.MAX_CONTENT_CHARACTERS:
+                destination = memory_store.pin_destination(
+                    self.store, message["id"], self.client.agent_id)
+                if (operation == "ingest"
+                        and len(message["content"]) > memory_store.MAX_CONTENT_CHARACTERS):
                     raise ValueError("Saved text exceeds 16000 characters; keep the transcript and "
                                      "send a shorter new message. This payload cannot be retried.")
                 receipt = self.client.deliver(operation, message, agent_id=destination)
             except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
-                code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-                permanent = (code is not None and 400 <= code < 500 and code not in {408, 425, 429}
+                code = (exc.response.status_code
+                        if isinstance(exc, httpx.HTTPStatusError) else None)
+                permanent = ((code is not None and 400 <= code < 500
+                              and code not in {408, 425, 429})
                              or isinstance(exc, (ValueError, TypeError, KeyError)))
                 error = (f"HTTP {code}: repair MemoryGate authorization or the rejected payload; "
                          "then stop Pi and use python -m pi.memory_recovery retry."

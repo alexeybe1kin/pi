@@ -1,15 +1,17 @@
 """Durable wire receipts and recovery, including the losing resume caller."""
+
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
+from test_tool_turns import CALL, FakeGate, build
 
 from pi import actions
 from pi.loop import TurnFailed
+from pi.providers import ProviderUnavailable
 from pi.store import Store
 from pi.toolgate import ToolGateClient, ToolPending
-from test_tool_turns import CALL, FakeGate, build
 
 
 def test_id_is_committed_before_dispatch_and_reused_with_owner_job(tmp_path, monkeypatch):
@@ -24,8 +26,15 @@ def test_id_is_committed_before_dispatch_and_reused_with_owner_job(tmp_path, mon
             return httpx.Response(200, json={"code": "CONFIRMATION_REQUIRED", "request_id": "req"})
         assert json["action_id"] == sent[0]["action_id"]
         assert json["job_id"] == "owner-job"
-        return httpx.Response(200, json={"code": "OK", "status": "completed",
-            "action_id": json["action_id"], "result": {"ok": True, "result": "sent"}})
+        return httpx.Response(
+            200,
+            json={
+                "code": "OK",
+                "status": "completed",
+                "action_id": json["action_id"],
+                "result": {"ok": True, "result": "sent"},
+            },
+        )
 
     gate = ToolGateClient("http://gate", "agent")
     monkeypatch.setattr(gate, "tools", FakeGate().tools)
@@ -38,16 +47,25 @@ def test_id_is_committed_before_dispatch_and_reused_with_owner_job(tmp_path, mon
     assert [m["role"] for m in store.messages(session)].count("tool") == 1
 
 
-@pytest.mark.parametrize("body,status", [({}, "outcome_unknown"),
-    ({"ok": "true"}, "outcome_unknown"),
-    ({"code": "IN_PROGRESS"}, "action_in_progress"),
-    ({"code": "OUTCOME_UNKNOWN"}, "outcome_unknown")])
-def test_ambiguous_receipts_hold_without_claiming_to_have_acted(tmp_path, monkeypatch, body, status):
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        ({}, "outcome_unknown"),
+        ({"ok": "true"}, "outcome_unknown"),
+        ({"code": "IN_PROGRESS"}, "action_in_progress"),
+        ({"code": "OUTCOME_UNKNOWN"}, "outcome_unknown"),
+    ],
+)
+def test_ambiguous_receipts_hold_without_claiming_to_have_acted(
+    tmp_path, monkeypatch, body, status
+):
     store = Store(tmp_path / "pi.db")
     gate = ToolGateClient("http://gate", "agent")
     monkeypatch.setattr(gate, "tools", FakeGate().tools)
     posts = []
-    monkeypatch.setattr(httpx, "post", lambda *a, **kw: posts.append(kw) or httpx.Response(200, json=body))
+    monkeypatch.setattr(
+        httpx, "post", lambda *a, **kw: posts.append(kw) or httpx.Response(200, json=body)
+    )
     monkeypatch.setattr(httpx, "get", lambda *a, **kw: httpx.Response(200, json=body))
     loop, provider = build(store, [CALL, "I did it"], gate)
     result = loop.run_turn(store.create_session(), "send")
@@ -57,15 +75,27 @@ def test_ambiguous_receipts_hold_without_claiming_to_have_acted(tmp_path, monkey
     assert len(posts) == 1 and len(provider.sent) == 1
 
 
-def test_negative_durable_receipt_does_not_mark_acted(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reply_fails", [False, True])
+def test_negative_durable_receipt_does_not_mark_acted(tmp_path, monkeypatch, reply_fails):
     store = Store(tmp_path / "pi.db")
     gate = ToolGateClient("http://gate", "agent")
     monkeypatch.setattr(gate, "tools", FakeGate().tools)
-    monkeypatch.setattr(httpx, "post", lambda *a, **kw: httpx.Response(200, json={
-        "code": "TOOL_UNAVAILABLE", "status": "completed", "result": {"ok": False}}))
-    loop, _ = build(store, [CALL, "Unavailable"], gate)
-    result = loop.run_turn(store.create_session(), "send")
-    assert store.get_turn(result["turn_id"])["acted"] == 0
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *a, **kw: httpx.Response(
+            200, json={"code": "TOOL_UNAVAILABLE", "status": "completed", "result": {"ok": False}}
+        ),
+    )
+    reply = ProviderUnavailable("reply failed") if reply_fails else "Unavailable"
+    loop, _ = build(store, [CALL, reply], gate)
+    session = store.create_session()
+    if reply_fails:
+        with pytest.raises(TurnFailed):
+            loop.run_turn(session, "send")
+    else:
+        loop.run_turn(session, "send")
+    assert store.turns(session)[0]["acted"] == 0
 
 
 def test_concurrent_resume_has_one_dispatch_and_stale_failure_cannot_land(tmp_path):
@@ -85,6 +115,7 @@ def test_concurrent_resume_has_one_dispatch_and_stale_failure_cannot_land(tmp_pa
         return row
 
     store.get_turn = simultaneous_read
+
     def resume():
         try:
             return loop.resume_turn(turn)["status"]
@@ -123,3 +154,37 @@ def test_restart_with_dispatch_record_holds_for_receipt(tmp_path):
     loop, _ = build(store, [], gate)
     assert loop.resume_turn(turn)["status"] == "outcome_unknown"
     assert gate.invocations == []
+
+
+def test_budget_denial_without_approval_holds_stable_identity(tmp_path, monkeypatch):
+    store = Store(tmp_path / "pi.db")
+    sent = []
+    gate = ToolGateClient("http://gate", "agent")
+    monkeypatch.setattr(gate, "tools", FakeGate().tools)
+
+    def post(url, *, json, **kwargs):
+        sent.append(json)
+        if not json.get("job_id"):
+            return httpx.Response(403, json={"detail": {"code": "BUDGET_DENIED",
+                "message": "Use the owner's job"}})
+        assert json["job_id"] == "owner-job"
+        return httpx.Response(200, json={"code": "OK", "status": "completed",
+            "result": {"ok": True, "result": "sent"}})
+
+    monkeypatch.setattr(httpx, "post", post)
+    loop, provider = build(store, [CALL, "sent"], gate)
+    held = loop.run_turn(store.create_session(), "send")
+    assert held["status"] == "awaiting_budget" and held["acted"] is False
+    assert len(provider.sent) == 1
+    assert store.get_turn(held["turn_id"])["action"]["id"] == held["action_id"]
+    assert loop.resume_turn(held["turn_id"], job_id="owner-job")["acted"] is True
+    assert len(sent) == 2 and sent[0]["action_id"] == sent[1]["action_id"]
+
+
+def test_legacy_interrupted_acted_turn_is_in_unreplied_queue(tmp_path):
+    store = Store(tmp_path / "pi.db")
+    turn = store.start_turn(store.create_session())
+    store.finish_turn(turn, "interrupted", acted=1)
+    assert [row["id"] for row in store.acted_without_reply()] == [turn]
+    loop, _ = build(store, ["done earlier"], FakeGate())
+    assert loop.resume_turn(turn)["acted"] is True
