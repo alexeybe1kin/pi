@@ -7,8 +7,8 @@ Tool calls arrive in #29 and go out through ToolGate, never from here.
 """
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 import os
 import secrets
 import time
@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .browser_contract import runtime_allowed
 from .loop import ActedWithoutReply, Loop, TurnFailed
 from .memory import Memory, MemoryClient
 from .openrouter import OpenRouterProvider
@@ -25,7 +26,6 @@ from .providers import OllamaProvider
 from .routing import Router
 from .store import Store
 from .toolgate import ToolGateClient
-from .browser_contract import runtime_allowed
 
 log = logging.getLogger("pi")
 
@@ -40,8 +40,13 @@ _health_cache: dict = {}
 async def lifespan(app: FastAPI):
     admin_key = os.environ.get("PI_ADMIN_KEY", "").strip()
     runtime_hash = os.environ.get("PI_GATEWAY_KEY_SHA256", "").strip()
-    if runtime_hash and (len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash)):
-        raise RuntimeError("Set PI_GATEWAY_KEY_SHA256 to the gateway credential's SHA-256 hex digest, then restart Pi.")
+    if runtime_hash and (
+        len(runtime_hash) != 64 or any(c not in "0123456789abcdef" for c in runtime_hash)
+    ):
+        raise RuntimeError(
+            "Set PI_GATEWAY_KEY_SHA256 to the gateway credential's SHA-256 hex digest, "
+            "then restart Pi."
+        )
     # Secure by default, or refuse to start. Never fall back to open - the rule
     # has a scar behind it, see ADR-0005.
     if len(admin_key) < 16:
@@ -136,7 +141,9 @@ def require_key(request: Request, x_pi_key: str | None = Header(None, alias="X-P
         if not runtime_allowed(request.method, request.url.path):
             raise HTTPException(403, "Gateway credential cannot perform this operation.")
         return "gateway-runtime"
-    raise HTTPException(401, "Missing or invalid runtime credential. Check gateway provisioning on the host.")
+    raise HTTPException(
+        401, "Missing or invalid runtime credential. Check gateway provisioning on the host."
+    )
 
 
 class NewSession(BaseModel):

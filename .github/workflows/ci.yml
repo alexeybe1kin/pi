@@ -60,6 +60,9 @@ jobs:
       - name: Tests
         run: python -m pytest tests/ --ignore=tests/test_module_contract.py -q
 
+      - name: Browser authority mutation drill
+        run: python scripts/auth_mutation_drill.py
+
   contract:
     # The health contract is an HTTP contract, so it is asserted against a
     # running container rather than an in-process app object - the thing that

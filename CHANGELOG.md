@@ -6,6 +6,15 @@ be a decision with visible consequences.
 
 ## Unreleased
 
+- Add a separate HTTPS browser gateway with host-managed password setup/recovery,
+  durable revocable sessions, CSRF protection, expiry and login attempt limits.
+  Pi accepts a distinct runtime key whose hash is deployed to the worker; owner
+  approval credentials remain exclusively in the gateway. ToolGate's new owner
+  endpoint contract remains a separate integration dependency.
+- Preserve memory notices across the browser proxy, refuse unlisted operations
+  and redirects, and provide live HTTPS and mutation drills. Gateway TLS identity
+  persists across restarts and renews only through an explicit host command.
+
 - Commit user evidence and its delivery outbox atomically; retry stable IDs without
   duplicate MemoryGate records. Serialize concurrent message sequence allocation.
 - Retrieve and retain exact per-turn memory context; expose pending ingestion and

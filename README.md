@@ -2,8 +2,10 @@
 
 Conker's runtime. Agent turns, sessions, jobs, model routing, execution history.
 
-Pi is the only service the browser talks to. Everything the owner sees passes through here, which
-is what keeps provider keys, admin keys and host paths off the client.
+The browser talks to a separate HTTPS gateway, shipped in this image but run in
+its own process and volume. Pi receives conversation operations through a scoped
+runtime credential; owner approval credentials and browser sessions stay outside
+the worker. [Browser API, password recovery and release gates](docs/browser-auth.md).
 
 Conversation evidence now reaches MemoryGate through a durable outbox. Retrieval and
 delivery gaps are visible independently of model replies. [Setup, forgetting and tests](docs/memory.md).
@@ -49,7 +51,9 @@ docker network create conker_net   # if it does not exist yet
 docker compose up -d --build
 ```
 
-API: `http://127.0.0.1:8050`. Every route except `/health` requires `X-Pi-Key: <PI_ADMIN_KEY>`.
+Development/recovery API: `http://127.0.0.1:8050`, using `X-Pi-Key: <PI_ADMIN_KEY>`.
+The companion deployment leaves this worker unpublished and uses the gateway's
+`X-Pi-Gateway-Key` credential for the explicit runtime operation allowlist.
 
 Pi **refuses to start** without a key of at least 16 characters, and says how to fix it. It never
 falls back to open.

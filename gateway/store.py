@@ -1,4 +1,5 @@
 """Durable single-owner credentials and revocable, opaque browser sessions."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,9 +9,9 @@ import secrets
 import sqlite3
 import threading
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator
 
 HASH_SLOTS = threading.BoundedSemaphore(1)
 
@@ -28,15 +29,24 @@ def digest(value: str) -> str:
 def password_hash(password: str, salt: bytes) -> str:
     # Bound memory even when several clients attempt expensive password checks.
     with HASH_SLOTS:
-        return hashlib.scrypt(password.encode(), salt=salt, n=2**17, r=8, p=1,
-                              maxmem=256 * 1024 * 1024).hex()
+        return hashlib.scrypt(
+            password.encode(), salt=salt, n=2**17, r=8, p=1, maxmem=256 * 1024 * 1024
+        ).hex()
 
 
 class AuthStore:
-    def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time,
-                 idle_seconds: int = 1800, absolute_seconds: int = 86400):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Callable[[], float] = time.time,
+        idle_seconds: int = 1800,
+        absolute_seconds: int = 86400,
+    ):
         if not 60 <= idle_seconds <= absolute_seconds <= 604800:
-            raise ValueError("Session lifetimes must satisfy 60 <= idle <= absolute <= 604800 seconds.")
+            raise ValueError(
+                "Session lifetimes must satisfy 60 <= idle <= absolute <= 604800 seconds."
+            )
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.clock = clock
@@ -86,8 +96,9 @@ class AuthStore:
             if initial and owner:
                 raise AuthError("A password already exists. Use reset-password on the host.", 409)
             generation = owner["generation"] + 1 if owner else 1
-            db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)",
-                       (salt.hex(), verifier, generation))
+            db.execute(
+                "INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (salt.hex(), verifier, generation)
+            )
             db.execute("DELETE FROM sessions")
             db.execute("DELETE FROM login_attempts")
 
@@ -97,8 +108,7 @@ class AuthStore:
 
     def _prune(self, db: sqlite3.Connection) -> None:
         now = self.clock()
-        db.execute("DELETE FROM sessions WHERE expires<=? OR touched<=?",
-                   (now, now - self.idle))
+        db.execute("DELETE FROM sessions WHERE expires<=? OR touched<=?", (now, now - self.idle))
         db.execute("DELETE FROM login_attempts WHERE at<=?", (now - 900,))
 
     def _new(self, db: sqlite3.Connection, authenticated: bool, generation: int) -> dict:
@@ -106,10 +116,17 @@ class AuthStore:
         now = self.clock()
         identity = secrets.token_urlsafe(18)
         expires = now + (self.absolute if authenticated else 600)
-        db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)",
-                   (digest(token), identity, csrf, int(authenticated), generation, now, now, expires))
-        return {"token": token, "id": identity, "csrf": csrf,
-                "authenticated": authenticated, "expires": expires}
+        db.execute(
+            "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)",
+            (digest(token), identity, csrf, int(authenticated), generation, now, now, expires),
+        )
+        return {
+            "token": token,
+            "id": identity,
+            "csrf": csrf,
+            "authenticated": authenticated,
+            "expires": expires,
+        }
 
     def anonymous(self) -> dict:
         with self.transaction() as db:
@@ -121,7 +138,9 @@ class AuthStore:
 
     def session(self, token: str, *, authenticated: bool = True) -> dict:
         with self.transaction() as db:
-            row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (digest(token),)).fetchone()
+            row = db.execute(
+                "SELECT * FROM sessions WHERE token_hash=?", (digest(token),)
+            ).fetchone()
             now = self.clock()
             if not row or row["expires"] <= now or row["touched"] <= now - self.idle:
                 raise AuthError("Session expired or revoked. Sign in again.")
@@ -138,8 +157,10 @@ class AuthStore:
         with self.transaction() as db:
             self._prune(db)
             attempts = db.execute("SELECT count(*) FROM login_attempts").fetchone()[0]
-            local = db.execute("SELECT count(*) FROM login_attempts WHERE source=? AND at>?",
-                               (digest(source), self.clock() - 300)).fetchone()[0]
+            local = db.execute(
+                "SELECT count(*) FROM login_attempts WHERE source=? AND at>?",
+                (digest(source), self.clock() - 300),
+            ).fetchone()[0]
             if attempts >= 30 or local >= 5:
                 raise AuthError("Too many login attempts. Wait fifteen minutes and retry.", 429)
             db.execute("INSERT INTO login_attempts VALUES(?,?)", (self.clock(), digest(source)))
@@ -148,14 +169,24 @@ class AuthStore:
         if not owner:
             raise AuthError("No password set. Run conker auth setup on the host.", 409)
         if len(password) > 1024 or not hmac.compare_digest(
-                password_hash(password, bytes.fromhex(owner["salt"])), owner["verifier"]):
-            raise AuthError("Password not accepted. Retry or use conker auth reset-password on the host.")
+            password_hash(password, bytes.fromhex(owner["salt"])), owner["verifier"]
+        ):
+            raise AuthError(
+                "Password not accepted. Retry or use conker auth reset-password on the host."
+            )
         with self.transaction() as db:
             current = db.execute("SELECT generation FROM owner WHERE id=1").fetchone()
-            row = db.execute("SELECT * FROM sessions WHERE token_hash=?", (digest(token),)).fetchone()
+            row = db.execute(
+                "SELECT * FROM sessions WHERE token_hash=?", (digest(token),)
+            ).fetchone()
             # A reset or logout during scrypt must not be undone by a late login.
-            if (not current or current[0] != owner["generation"] or not row
-                    or row["expires"] <= self.clock() or row["touched"] <= self.clock() - self.idle):
+            if (
+                not current
+                or current[0] != owner["generation"]
+                or not row
+                or row["expires"] <= self.clock()
+                or row["touched"] <= self.clock() - self.idle
+            ):
                 raise AuthError("Credentials changed during login. Start sign-in again.")
             db.execute("DELETE FROM sessions WHERE token_hash=?", (digest(token),))
             return self._new(db, True, owner["generation"])
@@ -170,5 +201,10 @@ class AuthStore:
     def sessions(self) -> list[dict]:
         with self.transaction() as db:
             self._prune(db)
-            return [dict(row) for row in db.execute(
-                "SELECT id,created,touched,expires FROM sessions WHERE authenticated=1 ORDER BY created")]
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,created,touched,expires FROM sessions "
+                    "WHERE authenticated=1 ORDER BY created"
+                )
+            ]

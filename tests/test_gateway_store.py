@@ -65,7 +65,9 @@ def test_host_reset_revokes_all_sessions_and_old_password(auth):
     with pytest.raises(AuthError):
         login(auth)
     new = auth.anonymous()
-    assert auth.login(new["token"], "a replacement passphrase for recovery", "local")["authenticated"]
+    assert auth.login(new["token"], "a replacement passphrase for recovery", "local")[
+        "authenticated"
+    ]
     with pytest.raises(AuthError, match="already exists"):
         auth.set_password(PASSWORD, initial=True)
 

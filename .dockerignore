@@ -20,6 +20,8 @@
 **/*.sqlite
 **/*.sqlite3
 **/vault.key
+**/tls.key
+**/tls.crt
 **/*.pem
 **/data
 **/backups
