@@ -6,6 +6,38 @@ be a decision with visible consequences.
 
 ## Unreleased
 
+## 0.4.0
+
+Memory, forgetting, browser auth, and the 2026-09-12 audit fixes.
+
+- **Pi now remembers.** Committed conversation evidence queues to MemoryGate
+  through a durable outbox under a stable id, retries cannot duplicate, and
+  retrieval is tied to the turn that used it. Ingestion or retrieval failure is
+  surfaced honestly rather than left to the model to mention.
+- **Forgetting is real.** An owner-only offline command removes a session's
+  messages and leaves content-free tombstones; citations to a deleted message
+  read as tombstones, not dangling ids. Deletion is bound to the namespace that
+  actually stored the evidence, so it works across an agent-id change.
+- **Browser authority.** A gateway owns login and revocable server-side
+  sessions with a Secure, HttpOnly, SameSite cookie, CSRF, expiry and logout.
+  The owner-approval credential is never handed to the worker; an agent
+  credential no longer implies approval authority.
+- **Provenance on approvals** — the owner's originating words travel with the
+  parked action, so an instruction injected into ingested content is visible as
+  a mismatch.
+- **Truthful money and status.** Unknown or incomplete model pricing counts as
+  not-free and unknown-cost, never zero, and a per-request fee is honoured, so a
+  paid model cannot slip through the free guard or be recorded at `$0`. A
+  missing or non-affirmative tool outcome is never read as success. `/health`
+  reports the model it must actually serve, not any installed model.
+- **Honest recovery under concurrency.** Resume is serialized and compares
+  state before writing, so a completed action is never overwritten as failed,
+  and an interrupted-but-acted turn stays retrievable.
+- **`action_id` on every dispatch**, matching ToolGate's durable-execution
+  contract; a hosted-catalogue outage no longer removes the working local model.
+- The image no longer carries build-context secrets, proven in CI.
+
+
 - Persist ToolGate action IDs before dispatch and reuse them through approval and
   budget waits. Attach owner-created jobs on resume; uncertain outcomes use status
   checks without redispatch. Missing or negative receipts never imply success.
